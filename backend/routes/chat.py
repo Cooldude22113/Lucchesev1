@@ -25,12 +25,10 @@ import asyncio
 from datetime import datetime, timezone
 from ddgs import DDGS
 from routes.memory import search_memory, ingest_exchange, should_ingest, classify_memory, is_duplicate_memory, col_knowledge, col_facts, col_style, detect_memory_command, handle_memory_command, REMEMBER_PATTERNS, FORGET_PATTERNS
-from routes.context_builder import build_context, ContextResult, emit_context_log
 from routes.database import save_message, get_roleplay_session, upsert_roleplay_session
 from routes.config import OLLAMA_URL, MODEL_FAST, MODEL_DEEP, ANTHROPIC_API_KEY, CHAT_PROVIDER
 from sheets import get_menu_context
 from routes.shopify import add_meal
-from routes.roleplay import run_roleplay
 from routes.scrape import detect_scrape_command, scrape_and_review
 
 
@@ -87,7 +85,7 @@ async def do_web_search(query: str, max_results: int = 4) -> str:
 
 
 # ── System prompt builder ─────────────────────────────────────────────────────
-def build_system_prompt(ctx: ContextResult | None, web_context: str, sheets_context: str = "") -> str:
+def build_system_prompt(web_context: str, sheets_context: str = "") -> str:
     """
     Assemble the full system prompt from a ContextResult and optional live data.
 
@@ -100,9 +98,6 @@ def build_system_prompt(ctx: ContextResult | None, web_context: str, sheets_cont
       4. Sheets live data (if present)
       5. Web search results (if present)
     """
-    if ctx is None:
-        ctx = ContextResult()
-
     now = datetime.now().strftime("%A, %d %B %Y")
 
     base = """You are Lucchese, the personal AI of Alex Hammond.
@@ -144,29 +139,6 @@ Only use this marker when the content is genuinely document-worthy (structured p
 programmes, checklists, reports). Not for short conversational answers."""
 
     sections = [f"Today's date is {now}.",base]
-
-    if ctx.tier1_block:
-        sections.append(f"""CURRENT FACTS ABOUT ALEX — TREAT AS GROUND TRUTH:
-These are verified, up-to-date facts. Do not frame them as things Alex "mentioned" or "said".
-Use them to ground every response.
-
-If CURRENT FACTS conflict with BACKGROUND KNOWLEDGE, CURRENT FACTS always win.
-BACKGROUND KNOWLEDGE may be historical and must not be treated as current unless it agrees with CURRENT FACTS.
-Do not describe old courses, old goals, or old projects as current unless they appear in CURRENT FACTS.
-
-{ctx.tier1_block}""")
-
-    if ctx.tier2_block:
-        sections.append(f"""BACKGROUND KNOWLEDGE ABOUT ALEX:
-The following is drawn from Alex's past conversations. This is your existing knowledge of him — not something to report back, but something you already know.
-Do NOT say "you mentioned" or "you said" or "you talked about". You simply know this about Alex.
-Do NOT quote it back. Reason from it. Let it shape how you respond, what you assume, what you challenge.
-If Alex asks what you know about a topic, answer as someone who already knows him — not as someone reading a file back to him.
-
---- Context ---
-{ctx.tier2_block}
-
----""")
 
     if sheets_context:
         sections.append(f"""Live data from PTPREPS Google Sheets:
@@ -215,29 +187,6 @@ async def chat(req: ChatRequest):
         save_message(conversation_id, "user", req.message)
         save_message(conversation_id, "assistant", reply)
         return stream_plain_reply(reply, auto_ingested=command == "remember")
-
-    # ── Deal analysis intercept ───────────────────────────────────────────────
-    if req.message.lower().startswith(("analyse deal:", "analyze deal:")):
-        from routes.deal import analyse_deal
-        reply = analyse_deal(req.message)
-        save_message(conversation_id, "user", req.message)
-        save_message(conversation_id, "assistant", reply)
-        return stream_plain_reply(reply)
-
-    # ── Roleplay intercept — delegates entirely to routes/roleplay.py ─────────
-    msg_lower          = req.message.lower().strip()
-    is_active_roleplay = get_roleplay_session(conversation_id) is not None
-    starts_roleplay    = any(x in msg_lower for x in [
-        "practice pitch", "role play property", "roleplay property", "start practice"
-    ])
-
-    if starts_roleplay or is_active_roleplay:
-        if starts_roleplay and not is_active_roleplay:
-            upsert_roleplay_session(conversation_id, 0)
-        reply = await run_roleplay(conversation_id, req.message, req.history)
-        save_message(conversation_id, "user", req.message)
-        save_message(conversation_id, "assistant", reply)
-        return stream_plain_reply(reply)
 
     # ── Action plan intercept ─────────────────────────────────────────────────────
     if req.message.lower().strip() in ["action plan", "action plan.", "action plan!"]:
@@ -351,21 +300,13 @@ async def chat(req: ChatRequest):
     web        = await do_web_search(req.message) if did_search else ""
     _personal_signals = ["ptpreps", "my ", "i am", "i'm", "we ", "our ", "alex"]
     _has_personal      = any(s in req.message.lower() for s in _personal_signals)
-    ctx = await build_context(req.message) if (not did_search or _has_personal) else ContextResult(
-        tier1_status="empty_source",
-        tier2_status="empty_source",
-        tier1_char_count=0,
-        tier2_char_count=0,
-        tier2_result_count=0,
-    )
 
     sheets     = get_menu_context(req.message)
 
     # STAB-001: emit structured context assembly log before prompt construction.
     # Captures tier status, char counts, and context sources at inference time.
-    emit_context_log(ctx, "chat", web, sheets)
 
-    messages = [{"role": "system", "content": build_system_prompt(ctx, web, sheets)}]
+    messages = [{"role": "system", "content": build_system_prompt(web, sheets)}]
     messages += req.history
     messages.append({"role": "user", "content": req.message})
 

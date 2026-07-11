@@ -25,7 +25,6 @@ from pydantic import BaseModel
 from routes.config import OLLAMA_URL, MODEL_FAST, CHAT_PROVIDER, ANTHROPIC_API_KEY, whisper_model, el_client, ELEVENLABS_VOICE_ID
 from routes.memory import should_ingest, ingest_exchange
 from routes.database import save_message, get_conversation_history
-from routes.context_builder import build_context
 from routes.chat import build_system_prompt
 
 router = APIRouter()
@@ -133,8 +132,8 @@ async def voice_chat(file: UploadFile = File(...), conversation_id: str = None):
         conv_id = conversation_id or str(uuid.uuid4())
 
         # 2. Build context
-        ctx = await build_context(user_text)
-        system = build_system_prompt(ctx, "", "")
+        # ctx = await build_context(user_text)
+        system = build_system_prompt( "", "")
 
         # Load last 20 messages for continuity
         history = get_conversation_history(conv_id, limit=20)

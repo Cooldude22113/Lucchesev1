@@ -12,10 +12,6 @@ from routes.conversations import router as conv_router
 from routes.files import router as files_router
 from routes.voice import router as voice_router
 from routes.shopify import router as shopify_router
-from routes.deal import router as deal_router
-from routes.state import router as state_router, init_state_db
-from routes.startup_validator import run_startup_validation
-
 
 # ── Context assembly logger (STAB-001 / STAB-003) ────────────────────────────
 # Scoped to "lucchese.context" only — does NOT touch the root logger format.
@@ -103,8 +99,6 @@ app.add_middleware(
 )
 
 init_db()
-init_state_db()
-run_startup_validation()   # STAB-005 — must run after init_db() and init_state_db()
 
 app.include_router(chat_router)
 app.include_router(admin_router)
@@ -112,5 +106,3 @@ app.include_router(conv_router)
 app.include_router(files_router)
 app.include_router(voice_router)
 app.include_router(shopify_router)
-app.include_router(deal_router)
-app.include_router(state_router)
