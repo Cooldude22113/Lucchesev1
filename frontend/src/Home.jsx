@@ -292,39 +292,6 @@ export default function Home() {
               </a>
             )}
           </Card>
-
-          {/* Property tools */}
-          <Card>
-            <p style={{ fontSize: "0.65rem", color: "#333", letterSpacing: 2, textTransform: "uppercase", marginBottom: "1rem" }}>Property Tools</p>
-
-            <div style={{ marginBottom: "1.2rem" }}>
-              <p style={{ fontSize: "0.8rem", color: "#e8e0d0", fontWeight: 500, marginBottom: 4 }}>Deal Analyser</p>
-              <p style={{ fontSize: "0.72rem", color: "#555", lineHeight: 1.6 }}>
-                In chat: <span style={{ color: gold, fontFamily: "monospace" }}>analyse deal: 3 bed Romford £320k, £1,200/month rent</span>
-              </p>
-            </div>
-
-            <div style={{ marginBottom: "1.2rem" }}>
-              <p style={{ fontSize: "0.8rem", color: "#e8e0d0", fontWeight: 500, marginBottom: 4 }}>Pitch Practice (Carol)</p>
-              <p style={{ fontSize: "0.72rem", color: "#555", lineHeight: 1.6 }}>
-                In chat: <span style={{ color: gold, fontFamily: "monospace" }}>practice pitch</span> — then type <span style={{ color: gold, fontFamily: "monospace" }}>end practice</span> for feedback
-              </p>
-            </div>
-
-            <div style={{ marginBottom: "1.2rem" }}>
-              <p style={{ fontSize: "0.8rem", color: "#e8e0d0", fontWeight: 500, marginBottom: 4 }}>Property Guide</p>
-              <p style={{ fontSize: "0.72rem", color: "#555", lineHeight: 1.6 }}>
-                Uploaded to Lucchese — ask anything about Essex property, HMO compliance, remortgaging, strategies
-              </p>
-            </div>
-
-            <div>
-              <p style={{ fontSize: "0.8rem", color: "#e8e0d0", fontWeight: 500, marginBottom: 4 }}>Family Summary Doc</p>
-              <p style={{ fontSize: "0.72rem", color: "#555", lineHeight: 1.6 }}>
-                Print-ready document for family meetings — covers equity release, Essex examples, risk, costs
-              </p>
-            </div>
-          </Card>
         </div>
 
         {/* Footer */}

@@ -53,6 +53,24 @@ def init_db():
             created_at      TEXT NOT NULL
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS traces (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT,
+            created_at      TEXT NOT NULL,
+            user_message    TEXT,
+            path            TEXT,
+            provider        TEXT,
+            model           TEXT,
+            web_search_used INTEGER NOT NULL DEFAULT 0,
+            status          TEXT,
+            duration_ms     INTEGER,
+            steps_json      TEXT
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at)"
+    )
     con.commit()
     con.close()
 
@@ -163,6 +181,58 @@ def delete_document_record(doc_id: str):
     con.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
     con.commit()
     con.close()
+
+
+# ── Traces ────────────────────────────────────────────────────────────────────
+TRACE_RETENTION = 500  # newest N traces kept; older ones pruned on every save
+
+
+def save_trace(trace: dict):
+    """Insert one finished chat trace and prune anything beyond the retention cap."""
+    con = get_con()
+    try:
+        con.execute("""
+            INSERT INTO traces (id, conversation_id, created_at, user_message, path,
+                                provider, model, web_search_used, status, duration_ms, steps_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            trace["id"], trace["conversation_id"], trace["created_at"],
+            trace["user_message"], trace["path"], trace["provider"], trace["model"],
+            trace["web_search_used"], trace["status"], trace["duration_ms"],
+            trace["steps_json"],
+        ))
+        con.execute("""
+            DELETE FROM traces WHERE id NOT IN (
+                SELECT id FROM traces ORDER BY created_at DESC LIMIT ?
+            )
+        """, (TRACE_RETENTION,))
+        con.commit()
+    except Exception as e:
+        print(f"save_trace error: {e}")
+        con.rollback()
+    finally:
+        con.close()
+
+
+def list_traces(limit: int = 50) -> list[dict]:
+    """Newest-first trace summaries — steps_json deliberately excluded for speed."""
+    con = get_con()
+    rows = con.execute("""
+        SELECT id, conversation_id, created_at, user_message, path, provider,
+               model, web_search_used, status, duration_ms
+        FROM traces ORDER BY created_at DESC LIMIT ?
+    """, (limit,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def get_trace(trace_id: str) -> dict | None:
+    con = get_con()
+    row = con.execute(
+        "SELECT * FROM traces WHERE id = ?", (trace_id,)
+    ).fetchone()
+    con.close()
+    return dict(row) if row else None
 
 
 # ── Session DB helpers ────────────────────────────────────────────────────────

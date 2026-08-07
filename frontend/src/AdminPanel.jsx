@@ -131,6 +131,233 @@ function RecentMemory({ item }) {
   );
 }
 
+// ── Debug tab (chat traces) ──────────────────────────────────────────────────
+const PATH_COLORS = {
+  chat:     "#c8a96e",
+  remember: "#7ce8a8",
+  forget:   "#e06c75",
+};
+
+const TRACE_STATUS_COLORS = {
+  ok:      "#7ce8a8",
+  partial: "#e8c87c",
+  error:   "#e06c75",
+};
+
+function Badge({ text, color }) {
+  return (
+    <span style={{
+      fontSize: "0.62rem", padding: "2px 6px", borderRadius: 4,
+      background: `${color}22`, color, border: `1px solid ${color}44`,
+      whiteSpace: "nowrap",
+    }}>{text}</span>
+  );
+}
+
+function TraceRow({ t, onClick }) {
+  const statusColor = TRACE_STATUS_COLORS[t.status] || "#666";
+  const time = t.created_at
+    ? new Date(t.created_at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+    : "";
+  return (
+    <div onClick={onClick} style={{
+      padding: "0.8rem 1rem", borderBottom: "1px solid #141414",
+      display: "flex", gap: 10, alignItems: "center", cursor: "pointer",
+    }}>
+      <div title={t.status} style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <p style={{
+          fontSize: "0.8rem", color: "#ccc", lineHeight: 1.5,
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        }}>{t.user_message}</p>
+        <div style={{ display: "flex", gap: 6, marginTop: 5, alignItems: "center", flexWrap: "wrap" }}>
+          <Badge text={t.path} color={PATH_COLORS[t.path] || "#666"} />
+          {t.model && <Badge text={t.model} color="#7cb8e8" />}
+          {!!t.web_search_used && <Badge text="web search" color="#7ce8e8" />}
+          <span style={{ fontSize: "0.62rem", color: "#444" }}>{(t.duration_ms / 1000).toFixed(1)}s</span>
+          <span style={{ fontSize: "0.62rem", color: "#444" }}>{time}</span>
+        </div>
+      </div>
+      <span style={{ color: "#333", fontSize: "0.8rem" }}>›</span>
+    </div>
+  );
+}
+
+function PipeNode({ label, sub, state }) {
+  const styles = {
+    ok:      { border: "1px solid #c8a96e88", color: "#c8a96e", background: "#c8a96e11", opacity: 1 },
+    error:   { border: "1px solid #e06c75",   color: "#e06c75", background: "#e06c7511", opacity: 1 },
+    skipped: { border: "1px solid #333",      color: "#555",    background: "transparent", opacity: 1 },
+    off:     { border: "1px solid #222",      color: "#444",    background: "transparent", opacity: 0.45 },
+  }[state] || {};
+  return (
+    <div style={{ padding: "0.4rem 0.65rem", borderRadius: 8, fontSize: "0.68rem", whiteSpace: "nowrap", textAlign: "center", ...styles }}>
+      <div>{label}</div>
+      {sub && <div style={{ fontSize: "0.58rem", opacity: 0.75, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function PipeRow({ label, nodes, taken }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginTop: 8, paddingLeft: "1.5rem" }}>
+      <span style={{ fontSize: "0.62rem", color: taken ? "#888" : "#3a3a3a", width: 110, flexShrink: 0 }}>{label}</span>
+      {nodes.map((n, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {i > 0 && <span style={{ color: taken ? "#444" : "#252525", fontSize: "0.7rem" }}>→</span>}
+          <PipeNode {...n} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PipelineDiagram({ trace }) {
+  const steps  = trace.steps || [];
+  const byName = {};
+  steps.forEach(s => { if (!byName[s.name]) byName[s.name] = s; });
+
+  const isCommand = trace.path === "remember" || trace.path === "forget";
+  const stepState = (name, taken) => {
+    if (!taken) return "off";
+    const s = byName[name];
+    if (!s) return "skipped";
+    return s.status === "error" ? "error" : s.status === "skipped" ? "skipped" : "ok";
+  };
+
+  const deleteSteps = steps.filter(s => s.name === "memory_delete");
+  const deleteState = !isCommand ? "off"
+    : deleteSteps.length === 0 ? "skipped"
+    : deleteSteps.some(s => s.status === "error") ? "error" : "ok";
+
+  const cmdNodes = !isCommand
+    ? [{ label: "Remember / Forget", state: "off" }, { label: "Update memory", state: "off" }]
+    : trace.path === "forget"
+      ? [
+          { label: "Forget command", state: "ok" },
+          { label: "Delete from memory", state: deleteState },
+          { label: "Save reply", state: stepState("save_reply", true) },
+        ]
+      : [
+          { label: "Remember command", state: "ok" },
+          { label: "Duplicate check", state: stepState("dedup_check", true) },
+          { label: "Classify (Ollama)", state: stepState("classify", true) },
+          { label: "Write to memory", state: stepState("memory_write", true) },
+          { label: "Save reply", state: stepState("save_reply", true) },
+        ];
+
+  const chatTaken = !isCommand;
+  const chatNodes = [
+    { label: "Web search?", sub: chatTaken ? (trace.web_search_used ? "YES" : "NO") : null, state: stepState("web_search_decision", chatTaken) },
+    { label: "DuckDuckGo", state: stepState("web_search", chatTaken) },
+    { label: "Build prompt", state: stepState("build_prompt", chatTaken) },
+    {
+      label: trace.provider === "ollama" ? "Ollama (local)" : "Claude API",
+      sub: chatTaken ? trace.model : null,
+      state: stepState("model_call", chatTaken),
+    },
+    { label: "Save reply", state: stepState("save_reply", chatTaken) },
+    {
+      label: "Memory decision",
+      sub: chatTaken ? (byName.ingest ? "SAVE" : byName.ingest_decision ? "not saved" : null) : null,
+      state: stepState("ingest_decision", chatTaken),
+    },
+    { label: "Write to memory", state: stepState("ingest", chatTaken) },
+  ];
+
+  return (
+    <div style={{
+      background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 10,
+      padding: "1rem", overflowX: "auto",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <PipeNode label="Message received" state={stepState("received", true)} />
+        <span style={{ color: "#444", fontSize: "0.7rem" }}>→</span>
+        <PipeNode label="Command check" sub={isCommand ? `matched '${trace.path}'` : "no match"} state={stepState("command_check", true)} />
+      </div>
+      <PipeRow label="Memory command path" nodes={cmdNodes} taken={isCommand} />
+      <PipeRow label="Normal chat path" nodes={chatNodes} taken={chatTaken} />
+    </div>
+  );
+}
+
+function StepCard({ step }) {
+  const [open, setOpen] = useState(false);
+  const mark      = step.status === "error" ? "✗" : step.status === "skipped" ? "○" : "✓";
+  const markColor = step.status === "error" ? "#e06c75" : step.status === "skipped" ? "#444" : "#7ce8a8";
+  const hasDetail = step.detail && Object.keys(step.detail).length > 0;
+  return (
+    <div style={{ borderBottom: "1px solid #141414", padding: "0.7rem 1rem" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+        <span style={{ color: markColor, fontSize: "0.8rem", width: 14, flexShrink: 0 }}>{mark}</span>
+        <p style={{ flex: 1, fontSize: "0.8rem", color: step.status === "skipped" ? "#555" : "#ccc", lineHeight: 1.5 }}>
+          {step.summary}
+        </p>
+        <span style={{ fontSize: "0.65rem", color: "#444", whiteSpace: "nowrap" }}>{step.duration_ms} ms</span>
+      </div>
+      {step.error && (
+        <p style={{ fontSize: "0.72rem", color: "#e06c75", margin: "0.4rem 0 0 24px", wordBreak: "break-word" }}>
+          {step.error}
+        </p>
+      )}
+      {hasDetail && (
+        <div style={{ marginLeft: 24, marginTop: 4 }}>
+          <button onClick={() => setOpen(!open)} style={{ fontSize: "0.65rem", color: "#c8a96e99", padding: 0 }}>
+            {open ? "▾ hide technical detail" : "▸ show technical detail"}
+          </button>
+          {open && (
+            <pre style={{
+              fontSize: "0.65rem", color: "#888", background: "#0a0a0a",
+              border: "1px solid #1a1a1a", borderRadius: 6, padding: "0.6rem",
+              marginTop: 4, overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word",
+            }}>
+              {JSON.stringify(step.detail, null, 2)}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TraceDetail({ trace, onBack }) {
+  const statusColor = TRACE_STATUS_COLORS[trace.status] || "#666";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+      <div style={{
+        background: "#0f0f0f", border: "1px solid #1e1e1e", borderRadius: 12,
+        padding: "1.2rem 1.5rem",
+      }}>
+        <button onClick={onBack} style={{ fontSize: "0.72rem", color: "#555", padding: 0, marginBottom: "0.8rem" }}>
+          ← Back to all messages
+        </button>
+        <p style={{ fontSize: "0.9rem", color: "#e8e0d0", lineHeight: 1.5 }}>{trace.user_message}</p>
+        <div style={{ display: "flex", gap: 6, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <Badge text={trace.status} color={statusColor} />
+          <Badge text={trace.path} color={PATH_COLORS[trace.path] || "#666"} />
+          {trace.model && <Badge text={`${trace.model} (${trace.provider})`} color="#7cb8e8" />}
+          {!!trace.web_search_used && <Badge text="web search" color="#7ce8e8" />}
+          <span style={{ fontSize: "0.65rem", color: "#444" }}>
+            total {(trace.duration_ms / 1000).toFixed(1)}s
+          </span>
+          <span style={{ fontSize: "0.65rem", color: "#444" }}>
+            {trace.created_at && new Date(trace.created_at).toLocaleString("en-GB")}
+          </span>
+        </div>
+      </div>
+
+      <PipelineDiagram trace={trace} />
+
+      <div style={{ background: "#0f0f0f", border: "1px solid #1e1e1e", borderRadius: 12, overflow: "hidden" }}>
+        <div style={{ padding: "1rem 1.2rem", borderBottom: "1px solid #1a1a1a" }}>
+          <p style={{ fontSize: "0.8rem", color: "#888" }}>What happened, step by step</p>
+        </div>
+        {(trace.steps || []).map((s, i) => <StepCard key={i} step={s} />)}
+      </div>
+    </div>
+  );
+}
+
 export default function AdminPanel() {
   const [stats, setStats]             = useState(null);
   const [recent, setRecent]           = useState([]);
@@ -143,6 +370,9 @@ export default function AdminPanel() {
   const [summarising, setSummarising] = useState(false);
   const [summariseResult, setSummariseResult] = useState(null);
   const [summaries, setSummaries]             = useState([]);
+  const [traces, setTraces]                   = useState([]);
+  const [selectedTrace, setSelectedTrace]     = useState(null);
+  const [loadingTraces, setLoadingTraces]     = useState(false);
 
   useEffect(() => {
     Promise.all([
@@ -156,6 +386,35 @@ export default function AdminPanel() {
       setLoading(false);
     }).catch(() => setLoading(false));
   }, []);
+
+  const loadTraces = async () => {
+    setLoadingTraces(true);
+    try {
+      const res = await fetch(`${API}/admin/traces?limit=50`, {
+        headers: { "X-Admin-Key": import.meta.env.VITE_ADMIN_KEY }
+      });
+      const data = await res.json();
+      setTraces(Array.isArray(data) ? data : []);
+    } catch {
+      setTraces([]);
+    }
+    setLoadingTraces(false);
+  };
+
+  useEffect(() => {
+    if (activeTab === "debug") loadTraces();
+  }, [activeTab]);
+
+  const openTrace = async (id) => {
+    try {
+      const res = await fetch(`${API}/admin/traces/${id}`, {
+        headers: { "X-Admin-Key": import.meta.env.VITE_ADMIN_KEY }
+      });
+      if (res.ok) setSelectedTrace(await res.json());
+    } catch {
+      // keep the list view if the detail fetch fails
+    }
+  };
 
   const doSearch = async () => {
     if (!search.trim()) return;
@@ -251,7 +510,7 @@ export default function AdminPanel() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 8, marginBottom: "1.5rem" }}>
-          {["overview", "recent", "search", "summaries", "manage"].map(t => (
+          {["overview", "recent", "search", "summaries", "manage", "debug"].map(t => (
             <button key={t} onClick={() => setActiveTab(t)} style={{
               padding: "0.45rem 1rem",
               borderRadius: 8,
@@ -516,6 +775,41 @@ export default function AdminPanel() {
               })}
             </div>
           </>
+        )}
+
+        {/* Debug tab — chat traces */}
+        {activeTab === "debug" && (
+          selectedTrace ? (
+            <TraceDetail trace={selectedTrace} onBack={() => setSelectedTrace(null)} />
+          ) : (
+            <div style={{ background: "#0f0f0f", border: "1px solid #1e1e1e", borderRadius: 12, overflow: "hidden" }}>
+              <div style={{
+                padding: "1rem 1.2rem", borderBottom: "1px solid #1a1a1a",
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+              }}>
+                <div>
+                  <p style={{ fontSize: "0.8rem", color: "#888" }}>Recent messages, newest first</p>
+                  <p style={{ fontSize: "0.7rem", color: "#444", marginTop: 2 }}>
+                    Click one to see exactly what the app did with it
+                  </p>
+                </div>
+                <button onClick={loadTraces} disabled={loadingTraces} style={{
+                  padding: "0.35rem 0.8rem", borderRadius: 7,
+                  border: "1px solid #c8a96e44", color: "#c8a96e",
+                  fontSize: "0.72rem", opacity: loadingTraces ? 0.5 : 1,
+                }}>
+                  {loadingTraces ? "..." : "Refresh"}
+                </button>
+              </div>
+              {traces.length === 0 ? (
+                <p style={{ padding: "2rem", color: "#444", fontSize: "0.8rem", textAlign: "center" }}>
+                  {loadingTraces ? "Loading..." : "No traces yet — send a chat message first"}
+                </p>
+              ) : (
+                traces.map(t => <TraceRow key={t.id} t={t} onClick={() => openTrace(t.id)} />)
+              )}
+            </div>
+          )
         )}
 
       </div>

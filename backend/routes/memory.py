@@ -5,10 +5,12 @@ Handles: classification, ingestion, deduplication, search, query expansion, memo
 """
 
 import re
+import time
 import uuid
 import math
 import httpx
 from datetime import datetime, timezone
+from routes import tracer
 from sentence_transformers import CrossEncoder
 import chromadb
 from chromadb.utils import embedding_functions
@@ -110,6 +112,7 @@ async def classify_memory(text: str) -> str:
     Classify a memory chunk using the local Ollama model.
     Fast, private, no API calls. Falls back to general if model fails.
     """
+    start = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.post(
@@ -135,31 +138,54 @@ Category:"""
             )
             result = res.json()["message"]["content"].strip().lower()
             result = result.split()[0].strip(".,\n")
-            return result if result in CATEGORIES else "general"
+            category = result if result in CATEGORIES else "general"
+            tracer.current().add_step(
+                "classify",
+                f"Asked the local Ollama model '{MODEL_FAST}' to pick a category → '{category}'.",
+                detail={
+                    "provider":    "ollama",
+                    "model":       MODEL_FAST,
+                    "input_chars": len(text[:500]),
+                    "raw_answer":  result,
+                    "category":    category,
+                },
+                duration_ms=(time.perf_counter() - start) * 1000,
+            )
+            return category
     except Exception as e:
         print(f"classify_memory error: {e}")
+        tracer.current().add_step(
+            "classify",
+            "Ollama classification failed — defaulting the category to 'general'.",
+            status="error", error=f"{type(e).__name__}: {e}",
+            detail={"provider": "ollama", "model": MODEL_FAST},
+            duration_ms=(time.perf_counter() - start) * 1000,
+        )
         return "general"
 
 # ── Memory quality filter ─────────────────────────────────────────────────────
-def should_ingest(user_msg: str, assistant_reply: str) -> bool:
+def should_ingest(user_msg: str, assistant_reply: str) -> tuple[bool, dict]:
+    """Decide whether an exchange is worth saving to memory: (decision, reason)."""
     msg = user_msg.lower().strip()
 
     if len(msg) < 30:
-        return False
+        return False, {"rule": "too_short", "matched": len(msg)}
 
     uncertainty = ["i don't know", "i'm not sure", "i can't find", "i don't have"]
-    if any(p in assistant_reply.lower() for p in uncertainty):
-        return False
+    for p in uncertainty:
+        if p in assistant_reply.lower():
+            return False, {"rule": "uncertain_reply", "matched": p}
 
     signals = [
         "my ", "i am", "i'm", "we ", "i have", "i've", "i do", "i don't",
         "alex", "ptpreps", "prefer", "always", "never", "usually", "hate",
         "love", "want", "need", "goal", "plan", "think", "believe", "feel"
     ]
-    if any(w in msg for w in signals):
-        return True
+    for w in signals:
+        if w in msg:
+            return True, {"rule": "signal", "matched": w}
 
-    return False
+    return False, {"rule": "no_signal", "matched": None}
 
 def _strip_preamble(text: str, min_words: int = 12) -> str:
     """Strip short preamble sentences from assistant responses."""
@@ -186,6 +212,7 @@ async def ingest_exchange(conversation_id: str, user_msg: str, assistant_reply: 
     Reclassify will also route these with LLM accuracy on the next run,
     producing higher-quality routing than the length-based threshold here.
     """
+    start     = time.perf_counter()
     now       = datetime.now(timezone.utc).isoformat()
     pair_idx  = uuid.uuid4().hex[:8]
     user_text = user_msg.strip()
@@ -222,6 +249,8 @@ async def ingest_exchange(conversation_id: str, user_msg: str, assistant_reply: 
     }
  
     # Embed user_text only — assistant text caused embedding contamination
+    knowledge_written = 0
+    knowledge_dups    = 0
     for i, chunk in enumerate(chunk_text(user_text)):
         if not is_duplicate_memory(chunk, col_knowledge):
             col_knowledge.upsert(
@@ -229,10 +258,14 @@ async def ingest_exchange(conversation_id: str, user_msg: str, assistant_reply: 
                 documents = [chunk],
                 metadatas = [{**base_meta, "chunk_idx": str(i)}],
             )
+            knowledge_written += 1
+        else:
+            knowledge_dups += 1
  
     # Facts — use should_ingest() for intent check, not raw length threshold.
     # Old threshold (> 20 chars) stored "ok" and "yes" as facts.
-    if len(user_text) >= 50 and should_ingest(user_text, assistant_reply):
+    fact_written = False
+    if len(user_text) >= 50 and should_ingest(user_text, assistant_reply)[0]:
         if not is_duplicate_memory(user_text, col_facts):
             col_facts.upsert(
                 ids       = [f"lucchese_fact_{conversation_id}_{pair_idx}"],
@@ -243,8 +276,10 @@ async def ingest_exchange(conversation_id: str, user_msg: str, assistant_reply: 
                     "source_knowledge_id": f"lucchese_{conversation_id}_{pair_idx}_0",
                 }],
             )
+            fact_written = True
  
     # Style — keep 100 char minimum, only substantive messages
+    style_written = False
     if len(user_text) >= 100:
         if not is_duplicate_memory(user_text, col_style):
             col_style.upsert(
@@ -256,6 +291,25 @@ async def ingest_exchange(conversation_id: str, user_msg: str, assistant_reply: 
                     "source_knowledge_id": f"lucchese_{conversation_id}_{pair_idx}_0",
                 }],
             )
+            style_written = True
+
+    summary = f"Saved the exchange to memory (ChromaDB): {knowledge_written} knowledge chunk{'s' if knowledge_written != 1 else ''} written"
+    if knowledge_dups:
+        summary += f" ({knowledge_dups} duplicate{'s' if knowledge_dups != 1 else ''} skipped)"
+    summary += ", stored as a fact" if fact_written else ", not stored as a fact"
+    summary += ", style sample stored." if style_written else ", no style sample."
+    tracer.current().add_step(
+        "ingest", summary,
+        detail={
+            "pair_idx":                     pair_idx,
+            "knowledge_chunks_written":     knowledge_written,
+            "knowledge_duplicates_skipped": knowledge_dups,
+            "fact_written":                 fact_written,
+            "style_written":                style_written,
+            "classification":               "deferred — no Ollama call here; reclassify routes it later",
+        },
+        duration_ms=(time.perf_counter() - start) * 1000,
+    )
 
 def ingest_document(doc_id: str, filename: str, text: str) -> int:
     chunks = chunk_text(text)
@@ -467,53 +521,104 @@ def detect_memory_command(message: str):
     for pattern in REMEMBER_PATTERNS:
         match = re.search(pattern, msg)
         if match:
+            tracer.current().add_step(
+                "command_check",
+                f"The message matched the 'remember' pattern {pattern!r} — handling it as a memory command.",
+                detail={"command": "remember", "pattern": pattern, "content": match.group(1).strip()},
+            )
             return ("remember", match.group(1).strip())
 
     for pattern in FORGET_PATTERNS:
         match = re.search(pattern, msg)
         if match:
             content = match.group(1).strip() if match.lastindex else ""
+            tracer.current().add_step(
+                "command_check",
+                f"The message matched the 'forget' pattern {pattern!r} — handling it as a memory command.",
+                detail={"command": "forget", "pattern": pattern, "content": content},
+            )
             return ("forget", content)
 
+    tracer.current().add_step(
+        "command_check",
+        "No memory command matched — treating this as a normal chat message.",
+        detail={
+            "command":          None,
+            "patterns_checked": len(REMEMBER_PATTERNS) + len(FORGET_PATTERNS),
+        },
+    )
     return (None, None)
 
 async def handle_memory_command(command: str, content: str, conversation_id: str) -> str:
     now = datetime.now(timezone.utc).isoformat()
 
     if command == "remember":
-        if not is_duplicate_memory(content, col_facts):
+        with tracer.current().step("dedup_check") as s:
+            duplicate = is_duplicate_memory(content, col_facts)
+            s.summary = ("Checked whether this fact is already in memory → an almost identical one is already stored."
+                         if duplicate else
+                         "Checked whether this fact is already in memory → it's new.")
+            s.detail  = {"duplicate": duplicate, "collection": "facts"}
+        if not duplicate:
+            category = await classify_memory(content)
+            fact_id  = f"explicit_fact_{uuid.uuid4().hex[:8]}"
             col_facts.upsert(
-                ids       = [f"explicit_fact_{uuid.uuid4().hex[:8]}"],
+                ids       = [fact_id],
                 documents = [content],
                 metadatas = [{
                     "source":     "explicit",
                     "conv_id":    conversation_id,
                     "type":       "fact",
-                    "category":   await classify_memory(content),
+                    "category":   category,
                     "created_at": now,
                 }]
             )
+            tracer.current().add_step(
+                "memory_write",
+                f"Saved the fact to long-term memory (ChromaDB 'facts' collection) under category '{category}'.",
+                detail={"chroma_id": fact_id, "collection": "facts", "category": category, "fact": content},
+            )
             return f"Got it, I'll remember that: *{content}*"
         else:
+            tracer.current().add_step(
+                "memory_write",
+                "Nothing written — an almost identical fact is already stored.",
+                status="skipped", detail={"collection": "facts"},
+            )
             return "I already have that stored."
 
     elif command == "forget":
         deleted = 0
         if content:
-            for col in [col_facts, col_knowledge, col_style]:
+            for col, col_name in [(col_facts, "facts"), (col_knowledge, "knowledge"), (col_style, "style")]:
                 try:
                     results = col.query(
                         query_texts=[content],
                         n_results=3,
                         include=["distances"]
                     )
+                    matches      = []
+                    deleted_here = 0
                     if results["ids"] and results["ids"][0]:
                         for id_, dist in zip(results["ids"][0], results["distances"][0]):
-                            if dist < 0.3:
+                            close_enough = dist < 0.3
+                            matches.append({"id": id_, "distance": round(dist, 4), "deleted": close_enough})
+                            if close_enough:
                                 col.delete(ids=[id_])
+                                deleted_here += 1
                                 deleted += 1
-                except Exception:
-                    pass
+                    tracer.current().add_step(
+                        "memory_delete",
+                        f"Searched the '{col_name}' collection for close matches → deleted {deleted_here} of {len(matches)} found.",
+                        detail={"collection": col_name, "query": content, "matches": matches},
+                    )
+                except Exception as e:
+                    tracer.current().add_step(
+                        "memory_delete",
+                        f"Searching the '{col_name}' collection failed — skipped it.",
+                        status="error", error=f"{type(e).__name__}: {e}",
+                        detail={"collection": col_name, "query": content},
+                    )
 
         if deleted:
             return "Done, I've removed that from my memory."

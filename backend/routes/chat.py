@@ -8,9 +8,9 @@ Main chat endpoint and its supporting logic:
   - System prompt builder
   - POST /chat
 
-Roleplay logic lives in routes/roleplay.py.
-Deal analysis logic lives in routes/deal.py.
-Shopify logic lives in routes/shopify.py.
+Every request is traced step-by-step (routes/tracer.py): readable lines in the
+backend terminal while the message processes, and a full record in the traces
+table for the admin Debug tab.
 """
 
 from fastapi import APIRouter
@@ -21,18 +21,19 @@ import httpx
 import uuid
 import re
 import json
+import time
 import asyncio
 from datetime import datetime, timezone
 from ddgs import DDGS
-from routes.memory import search_memory, ingest_exchange, should_ingest, classify_memory, is_duplicate_memory, col_knowledge, col_facts, col_style, detect_memory_command, handle_memory_command, REMEMBER_PATTERNS, FORGET_PATTERNS
-from routes.database import save_message, get_roleplay_session, upsert_roleplay_session
+from routes.memory import search_memory, ingest_exchange, should_ingest, detect_memory_command, handle_memory_command
+from routes.database import save_message
 from routes.config import OLLAMA_URL, MODEL_FAST, MODEL_DEEP, ANTHROPIC_API_KEY, CHAT_PROVIDER
-from sheets import get_menu_context
-from routes.shopify import add_meal
-from routes.scrape import detect_scrape_command, scrape_and_review
+from routes import tracer
 
 
 router = APIRouter()
+
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 
 # ── Request model ─────────────────────────────────────────────────────────────
@@ -51,59 +52,74 @@ WEB_TRIGGERS = [
     r"\b(final|winner|champion|trophy)\b",
 ]
 
-def needs_web_search(message: str) -> bool:
+INTERNAL_SIGNALS = [
+    "my ", "i am", "i'm", "remember",
+    "what have i", "what did i",
+]
+
+
+def needs_web_search(message: str) -> tuple[bool, dict]:
+    """Decide whether to run a web search, and say why: (decision, reason)."""
     msg = message.lower()
 
+    url_match = re.search(r'https?://|www\.|\.co\.uk|\.com|\.io', msg)
+    if url_match:
+        return True, {"rule": "url", "matched": url_match.group(0)}
 
-    if re.search(r'https?://|www\.|\.co\.uk|\.com|\.io', msg):
-        return True
-    
-    internal_signals = [
-        "macro", "recipe", "ingredient", "meal", "my ", "i am", "i'm",
-        "analyse deal", "analyze deal", "practice pitch", "remember",
-        "what have i", "what did i", "shopify",
-    ]
-    if any(s in msg for s in internal_signals):
-        return False
-    return any(re.search(p, msg) for p in WEB_TRIGGERS)
+    for signal in INTERNAL_SIGNALS:
+        if signal in msg:
+            return False, {"rule": "suppressed", "matched": signal}
 
+    for pattern in WEB_TRIGGERS:
+        match = re.search(pattern, msg)
+        if match:
+            return True, {"rule": "trigger", "matched": match.group(0)}
+
+    return False, {"rule": "no_match", "matched": None}
 
 
 async def do_web_search(query: str, max_results: int = 4) -> str:
+    start = time.perf_counter()
     try:
         results = await asyncio.to_thread(
             lambda: list(DDGS().text(query, max_results=max_results))
         )
+        duration = (time.perf_counter() - start) * 1000
         if not results:
+            tracer.current().add_step(
+                "web_search", "Searched DuckDuckGo → nothing came back.",
+                detail={"query": query, "result_count": 0}, duration_ms=duration,
+            )
             return ""
         lines = ["[Web search results:]"]
         for r in results:
             lines.append(f"• {r.get('title', '')}: {r.get('body', '')} ({r.get('href', '')})")
-        return "\n".join(lines)
-    except Exception:
+        text = "\n".join(lines)
+        tracer.current().add_step(
+            "web_search", f"Searched DuckDuckGo → {len(results)} results.",
+            detail={"query": query, "result_count": len(results), "results_text": text},
+            duration_ms=duration,
+        )
+        return text
+    except Exception as e:
+        tracer.current().add_step(
+            "web_search", "Web search failed — carrying on without web results.",
+            status="error", error=f"{type(e).__name__}: {e}",
+            detail={"query": query},
+            duration_ms=(time.perf_counter() - start) * 1000,
+        )
         return ""
 
 
 # ── System prompt builder ─────────────────────────────────────────────────────
-def build_system_prompt(web_context: str, sheets_context: str = "") -> str:
+def build_system_prompt(web_context: str) -> str:
     """
-    Assemble the full system prompt from a ContextResult and optional live data.
-
-    ctx=None is treated as an empty context (scrape/action-plan flows).
-
-    Section ordering:
-      1. base persona
-      2. Tier 1 — current-truth profile facts (if populated)
-      3. Tier 2 — episodic/ChromaDB memory (if populated)
-      4. Sheets live data (if present)
-      5. Web search results (if present)
+    Assemble the full system prompt: today's date, the base persona, and —
+    when a web search ran — a section with the results.
     """
     now = datetime.now().strftime("%A, %d %B %Y")
 
     base = """You are Lucchese, the personal AI of Alex Hammond.
-
-Alex runs PTPreps — a meal prep business in the UK selling high protein meals in standard and bulking portions, available as one-time purchases or subscriptions via Shopify.
-Alex is a personal trainer, into bodybuilding and martial arts, and is building this AI to automate his business and act as his most knowledgeable ally.
 
 You know Alex well. Speak to him like a straight-talking, highly knowledgeable friend — not an assistant trying to please him.
 
@@ -115,10 +131,8 @@ When Alex is wrong or off track, say so directly and explain why. Challenge idea
 Match Alex's tone — casual, direct, no fluff.
 Don't repeat yourself or over-explain.
 Always end your response with a short, relevant question to keep the conversation moving.
-Never guess or fabricate information about PTPreps, recipes, or macros — only use the Google Sheets data provided. If something isn't in the data, say so.
 If you don't know something current like sports results, news, or prices — say so honestly.
 When you use web search results, cite them naturally.
-For ANY question about meals, ingredients, macros, or allergens — ONLY use the Google Sheets data provided. If a meal is not in the Sheets data, say "I don't have that meal in our current menu."
 DOCUMENT GENERATION:
 When the user asks you to write something as a document, Word doc, plan, programme, report,
 or anything they'd want to save and use offline — generate the FULL content using proper
@@ -140,13 +154,6 @@ programmes, checklists, reports). Not for short conversational answers."""
 
     sections = [f"Today's date is {now}.",base]
 
-    if sheets_context:
-        sections.append(f"""Live data from PTPREPS Google Sheets:
----
-{sheets_context}
----
-Use this for any questions about recipes, ingredients, macros, or allergens.""")
-
     if web_context:
         sections.append(f"""Current information from the web:
 ---
@@ -162,236 +169,250 @@ Use this data to inform your response. For website reviews, analyse what the sea
 async def chat(req: ChatRequest):
     conversation_id = req.conversation_id or str(uuid.uuid4())
 
+    trace = tracer.Trace(req.message, conversation_id)
+    tracer.activate(trace)
+    trace.add_step(
+        "received",
+        f"Received a {len(req.message)}-character message"
+        + (" continuing an existing conversation." if req.conversation_id else " starting a new conversation."),
+        detail={
+            "message_chars":    len(req.message),
+            "new_conversation": not req.conversation_id,
+            "history_messages": len(req.history or []),
+            "provider_setting": CHAT_PROVIDER,
+        },
+    )
+
     def stream_plain_reply(reply: str, web_search_used: bool = False, auto_ingested: bool = False):
         async def generator():
-            yield json.dumps({"type": "meta", "conversation_id": conversation_id, "web_search_used": web_search_used}) + "\n"
+            yield json.dumps({"type": "meta", "conversation_id": conversation_id, "web_search_used": web_search_used, "trace_id": trace.id}) + "\n"
             yield json.dumps({"type": "token", "content": reply}) + "\n"
             yield json.dumps({"type": "done",  "auto_ingested": auto_ingested}) + "\n"
         return StreamingResponse(generator(), media_type="application/x-ndjson")
 
-    # ── Shopify command intercept ─────────────────────────────────────────────
-    shopify_match = re.search(r'shopify add (.+)|add (.+) to shopify', req.message.lower())
-    if shopify_match:
-        meal_name = (shopify_match.group(1) or shopify_match.group(2)).strip()
-        error, result = await add_meal(meal_name)
-        reply = error if error else (
-            f"Done! Created 4 products for {result['matched']} on Shopify:\n" +
-            "".join(f"  ✓ {p['title']}\n" for p in result["created"])
-        )
-        return stream_plain_reply(reply)
-
     # ── Memory command intercept ──────────────────────────────────────────────
     command, content = detect_memory_command(req.message)
     if command:
-        reply = await handle_memory_command(command, content, conversation_id)
-        save_message(conversation_id, "user", req.message)
-        save_message(conversation_id, "assistant", reply)
-        return stream_plain_reply(reply, auto_ingested=command == "remember")
-
-    # ── Action plan intercept ─────────────────────────────────────────────────────
-    if req.message.lower().strip() in ["action plan", "action plan.", "action plan!"]:
-        # Pull the last website review from memory
-        recent = await search_memory("website review ptpreps")
-        action_prompt = f"""Based on this website review:
-
-    {recent}
-
-    Create a concrete action plan for Alex. Format it as a numbered list of specific tasks, ordered by impact. For each task include:
-    - What exactly to change
-    - Why it matters
-    - How long it should take
-
-    Focus on the highest ROI changes first. Be specific — no vague advice."""
-        save_message(conversation_id, "user", req.message)
-        action_messages = [
-            {"role": "system", "content": build_system_prompt(None, "", "")},
-            {"role": "user", "content": action_prompt}
-        ]
-        async def action_stream():
-            full = []
-            yield json.dumps({"type": "meta", "conversation_id": conversation_id, "web_search_used": False}) + "\n"
-            try:
-                if CHAT_PROVIDER == "claude":
-                    async with httpx.AsyncClient(timeout=300) as client:
-                        res = await client.post(
-                            "https://api.anthropic.com/v1/messages",
-                            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                            json={"model": "claude-sonnet-4-6", "max_tokens": 4096, "system": action_messages[0]["content"], "messages": [action_messages[1]]}
-                        )
-                    text = res.json()["content"][0]["text"]
-                    full.append(text)
-                    yield json.dumps({"type": "token", "content": text}) + "\n"
-                else:
-                    async with httpx.AsyncClient(timeout=300) as client:
-                        async with client.stream("POST", OLLAMA_URL, json={"model": MODEL_FAST, "messages": action_messages, "stream": True}) as response:
-                            async for line in response.aiter_lines():
-                                if not line.strip(): continue
-                                try:
-                                    chunk = json.loads(line)
-                                    token = chunk.get("message", {}).get("content", "")
-                                    if token:
-                                        full.append(token)
-                                        yield json.dumps({"type": "token", "content": token}) + "\n"
-                                    if chunk.get("done"): break
-                                except Exception: continue
-            except Exception as e:
-                yield json.dumps({"type": "token", "content": f"Action plan error: {e}"}) + "\n"
-            reply = "".join(full)
-            if reply:
+        trace.path = command
+        try:
+            reply = await handle_memory_command(command, content, conversation_id)
+            with trace.step("save_reply") as s:
+                save_message(conversation_id, "user", req.message)
                 save_message(conversation_id, "assistant", reply)
-            yield json.dumps({"type": "done", "auto_ingested": False}) + "\n"
-        return StreamingResponse(action_stream(), media_type="application/x-ndjson")
-
-    # ── Scrape intercept ──────────────────────────────────────────────────────────
-    scrape_url = detect_scrape_command(req.message)
-    if scrape_url:
-        save_message(conversation_id, "user", req.message)
-        review_prompt = await scrape_and_review(scrape_url)
-        if review_prompt.startswith("Couldn't") or review_prompt.startswith("Failed"):
-            save_message(conversation_id, "assistant", review_prompt)
-            return stream_plain_reply(review_prompt)
-        # Send scrape content to LLM for review
-        scrape_messages = [
-            {"role": "system", "content": build_system_prompt(None, "", "")},
-            {"role": "user", "content": review_prompt}
-        ]
-        async def scrape_stream():
-            full = []
-            yield json.dumps({"type": "meta", "conversation_id": conversation_id, "web_search_used": False}) + "\n"
-            try:
-                if CHAT_PROVIDER == "claude":
-                    async with httpx.AsyncClient(timeout=300) as client:
-                        res = await client.post(
-                            "https://api.anthropic.com/v1/messages",
-                            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                            json={"model": "claude-sonnet-4-6", "max_tokens": 4096, "system": scrape_messages[0]["content"], "messages": [scrape_messages[1]]}
-                        )
-                    text = res.json()["content"][0]["text"]
-                    full.append(text)
-                    yield json.dumps({"type": "token", "content": text}) + "\n"
-                else:
-                    async with httpx.AsyncClient(timeout=300) as client:
-                        async with client.stream("POST", OLLAMA_URL, json={"model": MODEL_FAST, "messages": scrape_messages, "stream": True}) as response:
-                            async for line in response.aiter_lines():
-                                if not line.strip(): continue
-                                try:
-                                    chunk = json.loads(line)
-                                    token = chunk.get("message", {}).get("content", "")
-                                    if token:
-                                        full.append(token)
-                                        yield json.dumps({"type": "token", "content": token}) + "\n"
-                                    if chunk.get("done"): break
-                                except Exception: continue
-            except Exception as e:
-                yield json.dumps({"type": "token", "content": f"Review error: {e}"}) + "\n"
-            reply = "".join(full)
-            if reply:
-                save_message(conversation_id, "assistant", reply)
-                await ingest_exchange(
-                    conversation_id,
-                    f"Website review: {scrape_url}",
-                    reply
-                )
-            yield json.dumps({"type": "done", "auto_ingested": True}) + "\n"
-        return StreamingResponse(scrape_stream(), media_type="application/x-ndjson")
+                s.summary = "Saved the command and its reply to the conversation transcript."
+                s.detail  = {"reply_chars": len(reply)}
+            trace.finish(reply_ok=True)
+            return stream_plain_reply(reply, auto_ingested=command == "remember")
+        except Exception:
+            trace.finish(reply_ok=False)
+            raise
 
     # ── Normal chat flow ──────────────────────────────────────────────────────
-    did_search = needs_web_search(req.message)
-    web        = await do_web_search(req.message) if did_search else ""
-    _personal_signals = ["ptpreps", "my ", "i am", "i'm", "we ", "our ", "alex"]
-    _has_personal      = any(s in req.message.lower() for s in _personal_signals)
+    with trace.step("web_search_decision") as s:
+        did_search, search_reason = needs_web_search(req.message)
+        rule    = search_reason.get("rule")
+        matched = search_reason.get("matched")
+        if rule == "url":
+            s.summary = f"Checked whether this needs a web search → YES: the message contains a link ('{matched}')."
+        elif rule == "trigger":
+            s.summary = f"Checked whether this needs a web search → YES: the message contained '{matched}'."
+        elif rule == "suppressed":
+            s.summary = f"Checked whether this needs a web search → NO: '{matched.strip()}' makes it look personal, so it's answered without live search."
+        else:
+            s.summary = "Checked whether this needs a web search → NO: no live-information trigger words found."
+        s.detail = search_reason
+    trace.web_search_used = did_search
 
-    sheets     = get_menu_context(req.message)
+    web = ""
+    if did_search:
+        web = await do_web_search(req.message)   # records its own web_search step
+    else:
+        trace.add_step("web_search", "Skipped the web search.", status="skipped")
 
-    # STAB-001: emit structured context assembly log before prompt construction.
-    # Captures tier status, char counts, and context sources at inference time.
+    with trace.step("build_prompt") as s:
+        system_prompt = build_system_prompt(web)
+        base_chars    = len(build_system_prompt(""))
+        web_chars     = len(system_prompt) - base_chars
+        history       = req.history or []
+        history_chars = sum(len(str(m.get("content", ""))) for m in history if isinstance(m, dict))
+        if web:
+            s.summary = (f"Built the AI's instructions: persona {base_chars:,} chars"
+                         f" + web results section {web_chars:,} chars = {len(system_prompt):,} chars"
+                         f" (plus {len(history)} earlier messages as history).")
+        else:
+            s.summary = (f"Built the AI's instructions: persona {len(system_prompt):,} chars, no web section"
+                         f" (plus {len(history)} earlier messages as history).")
+        s.detail = {
+            "system_prompt":    system_prompt,
+            "sections":         [{"name": "date + persona", "chars": base_chars}]
+                                + ([{"name": "web results", "chars": web_chars}] if web else []),
+            "total_chars":      len(system_prompt),
+            "history_messages": len(history),
+            "history_chars":    history_chars,
+        }
 
-    messages = [{"role": "system", "content": build_system_prompt(web, sheets)}]
+    messages = [{"role": "system", "content": system_prompt}]
     messages += req.history
     messages.append({"role": "user", "content": req.message})
 
     save_message(conversation_id, "user", req.message)
 
     async def stream_response():
+        # Re-bind the trace here: async generators don't reliably inherit
+        # context set after the surrounding task was created.
+        tracer.activate(trace)
         full_reply  = []
         auto_ingest = False
-
-        yield json.dumps({
-            "type":            "meta",
-            "conversation_id": conversation_id,
-            "web_search_used": did_search,
-        }) + "\n"
+        reply_ok    = True
 
         try:
-            if CHAT_PROVIDER == "claude":
-                system_prompt = messages[0]["content"] if messages[0]["role"] == "system" else ""
-                chat_messages = [m for m in messages if m["role"] != "system"]
-                async with httpx.AsyncClient(timeout=300) as client:
-                    res = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key":         ANTHROPIC_API_KEY,
-                            "anthropic-version": "2023-06-01",
-                            "content-type":      "application/json",
-                        },
-                        json={
-                            "model":      "claude-sonnet-4-6",
-                            "max_tokens": 4096,
-                            "system":     system_prompt,
-                            "messages":   chat_messages,
-                        }
-                    )
-                if res.status_code != 200:
-                    raise Exception(f"Anthropic API error {res.status_code}: {res.text[:200]}")
-                reply_text = res.json()["content"][0]["text"]
-                full_reply.append(reply_text)
-                yield json.dumps({"type": "token", "content": reply_text}) + "\n"
+            yield json.dumps({
+                "type":            "meta",
+                "conversation_id": conversation_id,
+                "web_search_used": did_search,
+                "trace_id":        trace.id,
+            }) + "\n"
 
+            try:
+                if CHAT_PROVIDER == "claude":
+                    trace.provider = "claude"
+                    trace.model    = CLAUDE_MODEL
+                    chat_messages  = [m for m in messages if m["role"] != "system"]
+                    with trace.step("model_call") as s:
+                        s.error_summary = f"The Claude API call ({CLAUDE_MODEL}) failed — no reply was generated."
+                        async with httpx.AsyncClient(timeout=300) as client:
+                            res = await client.post(
+                                "https://api.anthropic.com/v1/messages",
+                                headers={
+                                    "x-api-key":         ANTHROPIC_API_KEY,
+                                    "anthropic-version": "2023-06-01",
+                                    "content-type":      "application/json",
+                                },
+                                json={
+                                    "model":      CLAUDE_MODEL,
+                                    "max_tokens": 4096,
+                                    "system":     system_prompt,
+                                    "messages":   chat_messages,
+                                }
+                            )
+                        if res.status_code != 200:
+                            raise Exception(f"Anthropic API error {res.status_code}: {res.text[:200]}")
+                        reply_text = res.json()["content"][0]["text"]
+                        s.summary = f"Called the Claude API ({CLAUDE_MODEL}) → HTTP {res.status_code}, got {len(reply_text):,} characters back."
+                        s.detail  = {
+                            "provider":         "claude",
+                            "model":            CLAUDE_MODEL,
+                            "http_status":      res.status_code,
+                            "request_messages": len(chat_messages) + 1,
+                            "request_chars":    len(system_prompt) + sum(len(str(m.get("content", ""))) for m in chat_messages),
+                            "response_chars":   len(reply_text),
+                            "max_tokens":       4096,
+                        }
+                    full_reply.append(reply_text)
+                    yield json.dumps({"type": "token", "content": reply_text}) + "\n"
+
+                else:
+                    # Ollama — true token streaming
+                    ollama_model   = MODEL_DEEP if req.deep else MODEL_FAST
+                    trace.provider = "ollama"
+                    trace.model    = ollama_model
+                    with trace.step("model_call") as s:
+                        s.error_summary = f"The local Ollama call ({ollama_model}) failed mid-stream."
+                        chunk_count = 0
+                        async with httpx.AsyncClient(timeout=300) as client:
+                            async with client.stream("POST", OLLAMA_URL, json={
+                                "model":    ollama_model,
+                                "messages": messages,
+                                "stream":   True,
+                            }) as response:
+                                async for line in response.aiter_lines():
+                                    if not line.strip():
+                                        continue
+                                    try:
+                                        chunk = json.loads(line)
+                                        token = chunk.get("message", {}).get("content", "")
+                                        if token:
+                                            full_reply.append(token)
+                                            chunk_count += 1
+                                            yield json.dumps({"type": "token", "content": token}) + "\n"
+                                        if chunk.get("done"):
+                                            break
+                                    except Exception:
+                                        continue
+                        response_chars = sum(len(t) for t in full_reply)
+                        s.summary = f"Called local Ollama model '{ollama_model}' (streamed) → got {response_chars:,} characters in {chunk_count} chunks."
+                        s.detail  = {
+                            "provider":         "ollama",
+                            "model":            ollama_model,
+                            "deep_mode":        bool(req.deep),
+                            "request_messages": len(messages),
+                            "request_chars":    sum(len(str(m.get("content", ""))) for m in messages),
+                            "response_chars":   response_chars,
+                            "stream_chunks":    chunk_count,
+                        }
+
+            except Exception as e:
+                reply_ok = False
+                print(f"stream_response error ({CHAT_PROVIDER}): {e}")
+                yield json.dumps({"type": "token", "content": "\n\n[Response error — please try again]"}) + "\n"
+
+            # ── Post-processing ───────────────────────────────────────────────
+            reply = "".join(full_reply)
+            if reply:
+                with trace.step("save_reply") as s:
+                    save_message(conversation_id, "assistant", reply)
+                    s.summary = f"Saved the {len(reply):,}-character reply to the conversation transcript."
+                    s.detail  = {"reply_chars": len(reply)}
+
+                user_corrections = [
+                    "we already", "actually", "that's wrong", "not quite",
+                    "to clarify", "we don't", "we do", "i am", "i'm not"
+                ]
+                matched_correction = next((p for p in user_corrections if p in req.message.lower()), None)
+
+                if matched_correction:
+                    auto_ingest = True
+                    trace.add_step(
+                        "ingest_decision",
+                        f"Memory decision → SAVE: the message contains the correction phrase '{matched_correction}'.",
+                        detail={"rule": "correction_phrase", "matched": matched_correction},
+                    )
+                    await ingest_exchange(conversation_id, req.message, reply)
+                elif did_search:
+                    trace.add_step(
+                        "ingest_decision",
+                        "Memory decision → NOT saved: replies based on web search results aren't stored.",
+                        detail={"rule": "web_search_skip"},
+                    )
+                else:
+                    auto_ingest, ingest_reason = should_ingest(req.message, reply)
+                    rule    = ingest_reason.get("rule")
+                    matched = ingest_reason.get("matched")
+                    if rule == "signal":
+                        summary = f"Memory decision → SAVE: the message contains the personal signal word '{str(matched).strip()}'."
+                    elif rule == "too_short":
+                        summary = "Memory decision → NOT saved: the message is under 30 characters — too short to be worth remembering."
+                    elif rule == "uncertain_reply":
+                        summary = f"Memory decision → NOT saved: the reply sounded unsure ('{matched}')."
+                    else:
+                        summary = "Memory decision → NOT saved: nothing personal detected in the message."
+                    trace.add_step("ingest_decision", summary, detail=ingest_reason)
+                    if auto_ingest:
+                        await ingest_exchange(conversation_id, req.message, reply)
             else:
-                # Ollama — true token streaming
-                async with httpx.AsyncClient(timeout=300) as client:
-                    async with client.stream("POST", OLLAMA_URL, json={
-                        "model":    MODEL_DEEP if req.deep else MODEL_FAST,
-                        "messages": messages,
-                        "stream":   True,
-                    }) as response:
-                        async for line in response.aiter_lines():
-                            if not line.strip():
-                                continue
-                            try:
-                                chunk = json.loads(line)
-                                token = chunk.get("message", {}).get("content", "")
-                                if token:
-                                    full_reply.append(token)
-                                    yield json.dumps({"type": "token", "content": token}) + "\n"
-                                if chunk.get("done"):
-                                    break
-                            except Exception:
-                                continue
+                trace.add_step("save_reply", "Nothing to save — no reply was produced.", status="skipped")
+
+            yield json.dumps({"type": "done", "auto_ingested": auto_ingest}) + "\n"
 
         except Exception as e:
-            print(f"stream_response error ({CHAT_PROVIDER}): {e}")
-            yield json.dumps({"type": "token", "content": "\n\n[Response error — please try again]"}) + "\n"
-
-        # ── Post-processing ───────────────────────────────────────────────────
-        reply = "".join(full_reply)
-        if reply:
-            save_message(conversation_id, "assistant", reply)
-
-            user_corrections = [
-                "we already", "actually", "that's wrong", "not quite",
-                "to clarify", "we don't", "we do", "i am", "i'm not"
-            ]
-            force_ingest = any(s in req.message.lower() for s in user_corrections)
-
-            if force_ingest:
-                auto_ingest = True
-                await ingest_exchange(conversation_id, req.message, reply)
-            elif not did_search:
-                auto_ingest = should_ingest(req.message, reply)
-                if auto_ingest:
-                    await ingest_exchange(conversation_id, req.message, reply)
-
-        yield json.dumps({"type": "done", "auto_ingested": auto_ingest}) + "\n"
+            # Failure outside the guarded model call (e.g. a memory write) —
+            # record it, then propagate exactly as before.
+            trace.add_step(
+                "pipeline_error", "Something failed after the reply was generated.",
+                status="error", error=f"{type(e).__name__}: {e}",
+            )
+            raise
+        finally:
+            trace.finish(reply_ok=reply_ok)
 
     return StreamingResponse(stream_response(), media_type="application/x-ndjson")

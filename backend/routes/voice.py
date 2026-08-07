@@ -133,7 +133,7 @@ async def voice_chat(file: UploadFile = File(...), conversation_id: str = None):
 
         # 2. Build context
         # ctx = await build_context(user_text)
-        system = build_system_prompt( "", "")
+        system = build_system_prompt("")
 
         # Load last 20 messages for continuity
         history = get_conversation_history(conv_id, limit=20)
@@ -180,7 +180,7 @@ async def voice_chat(file: UploadFile = File(...), conversation_id: str = None):
         # 4. Save + ingest
         save_message(conv_id, "user",      user_text)
         save_message(conv_id, "assistant", reply_text)
-        if should_ingest(user_text, reply_text):
+        if should_ingest(user_text, reply_text)[0]:
             await ingest_exchange(conv_id, user_text, reply_text)
 
         # 5. TTS — chunk reply and collect audio
