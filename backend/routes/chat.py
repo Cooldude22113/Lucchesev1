@@ -25,7 +25,7 @@ import time
 import asyncio
 from datetime import datetime, timezone
 from ddgs import DDGS
-from routes.memory import search_memory, ingest_exchange, should_ingest, detect_memory_command, handle_memory_command
+from routes.memory import ingest_exchange, should_ingest, detect_memory_command, handle_memory_command
 from routes.database import save_message
 from routes.config import OLLAMA_URL, MODEL_FAST, MODEL_DEEP, ANTHROPIC_API_KEY, CHAT_PROVIDER
 from routes import tracer
