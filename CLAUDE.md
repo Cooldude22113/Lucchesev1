@@ -78,8 +78,9 @@ frontend/src/
   Home.jsx             dashboard;  Voice.jsx  tap-to-talk page
 ```
 
-`AUDIT.md` in this repo is a full used/unused/half-finished map of every file.
-It's accurate as of the tracing commit — trust the code over it if they differ.
+`AUDIT.md` in this repo is a full used/unused/half-finished map of every file,
+regenerated 13 August 2026 against current code — trust the code over it if
+they differ.
 
 ## Conventions
 
@@ -97,9 +98,13 @@ It's accurate as of the tracing commit — trust the code over it if they differ
 ## Known gaps — read before "fixing" something that looks broken
 
 - **Memory is written but never read.** `search_memory()` in `memory.py` is
-  fully built (query expansion, cross-encoder reranking, recency bonus) and
-  imported by `chat.py` — but nothing calls it. Replies never see stored
-  memories. This is the top open item; see `STATE.md`.
+  fully built (query expansion, cross-encoder reranking, recency bonus) but has
+  zero callers and zero imports. Replies never see stored memories, and the
+  cross-encoder is loaded at every startup for nothing. Top open item; see
+  `STATE.md`.
+- **`/voice-chat` is not traced.** It runs its own copy of the chat pipeline
+  (`voice.py`) — own prompt build, own model call, own ingest decision — so
+  spoken messages never appear in the Debug tab.
 - `routes/scrape.py` exists but is mounted nowhere and has no caller — dead.
 - `roleplay_sessions` table and its helpers in `database.py` belong to a
   deleted feature.

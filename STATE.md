@@ -4,14 +4,15 @@
 right now, what would I need to know? Last thing each session: update it.
 First thing next session: read it.
 
-Last updated: 12 August 2026 · at commit `ce75d6a`
+Last updated: 13 August 2026 · at commit `da54368`
 
 ---
 
 ## Right now
 
-Nothing in progress. The repo is clean and the last three commits all landed.
-Good moment to start something new.
+Nothing in progress. The repo is clean. Tracing is finished and signed off —
+checked in the browser, and it's already tracing real messages on the live
+backend. Good moment to start something new.
 
 ## Recently finished
 
@@ -28,20 +29,28 @@ Good moment to start something new.
   and which word triggered it, the assembled prompt, which model was called,
   how long each step took, and swallowed errors. Readable lines print to the
   backend terminal; the full record goes to a `traces` table (newest 500 kept)
-  and is browsable in the admin **Debug** tab.
+  and is browsable in the admin **Debug** tab. Verified on all five paths
+  including a real Ollama timeout, which showed up as an error step with the
+  reply still delivered — exactly the intended behaviour.
+- **Refreshed `AUDIT.md`** — it predated both the business-code removal and
+  tracing, so a third of it described code that no longer existed. Rewritten
+  against current code, with a "what changed since the last audit" table at
+  the end.
 - **Deleted `.claude/agents/`** — stale Claude Code config pointing at files
   that no longer existed.
 
 ## Next up — in priority order
 
 1. **Wire memory reading into chat.** The biggest real gap: `search_memory()`
-   in `routes/memory.py` is fully built and imported by `chat.py`, but nothing
-   calls it. Lucchese saves memories it can never recall — ask it "what have I
-   told you about X" and it answers from the current conversation only. Fix:
-   call `search_memory(req.message)` in the normal chat flow and add the
-   results as a section in `build_system_prompt()`. Watch latency — it does an
-   Ollama query-expansion call plus a rerank; skip `expand_query` if slow.
-   Now that tracing exists, the trace will show exactly what it costs.
+   in `routes/memory.py` is fully built but has **zero callers and zero
+   imports** — `chat.py` stopped importing it in `da54368`. Lucchese saves
+   memories it can never recall — ask it "what have I told you about X" and it
+   answers from the current conversation only. Fix: call
+   `search_memory(req.message)` in the normal chat flow and add the results as
+   a section in `build_system_prompt()`. Watch latency — it does an Ollama
+   query-expansion call plus a rerank; skip `expand_query` if slow. Wrap it in
+   a trace step and the Debug tab will show exactly what it retrieved and what
+   it cost, per message.
 2. **Delete the remaining dead code** that `AUDIT.md` lists and the cleanup
    missed: `routes/scrape.py` (mounted nowhere, no callers), the
    `roleplay_sessions` table + helpers in `database.py`, `chroma_client.py`
@@ -58,8 +67,9 @@ Good moment to start something new.
 
 ## Watch out for
 
-- `AUDIT.md`'s pipeline diagram still shows the Shopify and Google Sheets
-  steps. Those are gone. The prose is fine; the diagram is stale.
+- `/voice-chat` runs its own untraced copy of the chat pipeline and is
+  drifting from `chat.py` — it misses tracing and hardcodes the model name.
+  Worth merging onto one shared path before the two diverge further.
 - `backend/raw/conversations_export.json` and `raw/extracted_user_messages/`
   are real conversation exports **committed to git**. Fine while the repo is
   private; `git rm --cached` them before it's ever shared.
