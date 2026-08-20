@@ -7,6 +7,28 @@ One entry per real decision. Newest at the top. Keep them short.
 
 ---
 
+## 2026-08 — Chat UI rebuilt from the Claude Design doc, direction 2b
+
+The redesign doc (`Lucchese Chat.dc.html`, project *Lucchese chat redesign*)
+offered two paths: **2a** sharpened today's layout, **2b** re-architected the
+reading experience. We took 2b, plus its states 2c–2i.
+
+The argument for 2b: the real complaint wasn't that the old screen was ugly,
+it was that a 400-word reply arrived as one undifferentiated wall capped at
+70% width. 2b lets the assistant bubble grow into the column and breaks long
+replies with hairline rules and Playfair section heads, so an answer scans in
+sections. 2a would have left that problem in place.
+
+Three Vite-template quirks in `index.css` were deliberately removed rather
+than designed around, because the design measures against a clean shell: the
+1126px `#root` cap with a border down each side, the inherited
+`text-align:center`, and `code { display:inline-flex }` — which turned every
+fenced block into one unwrappable chip that spilled past the bubble.
+
+Deliberately *not* done: the design's eight-second hands-free send is wired to
+the existing `Voice.jsx` timer, not to real silence detection. There is no VAD
+in this codebase and adding one is a separate piece of work.
+
 ## 2026-08 — Removed all PTPreps business code
 
 Alex left the meal-prep business, so everything built for it went: the Shopify
