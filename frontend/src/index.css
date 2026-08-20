@@ -54,12 +54,10 @@ body {
   margin: 0;
 }
 
+/* The Vite template capped #root at 1126px, drew a border down each side and
+   centred all text. Every screen lays itself out now, so the shell is neutral. */
 #root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
+  width: 100%;
   min-height: 100svh;
   display: flex;
   flex-direction: column;
@@ -98,14 +96,32 @@ p {
 code,
 .counter {
   font-family: var(--mono);
-  display: inline-flex;
   border-radius: 4px;
   color: var(--text-h);
 }
 
+.counter {
+  display: inline-flex;
+}
+
+/* inline-flex here turned a fenced block into one unwrappable chip that spilled
+   past its container — code is inline, and pre owns the block behaviour. */
 code {
+  display: inline;
   font-size: 15px;
   line-height: 135%;
   padding: 4px 8px;
   background: var(--code-bg);
+}
+
+pre {
+  margin: 0;
+  overflow-x: auto;
+}
+
+pre code {
+  display: block;
+  padding: 0;
+  background: none;
+  white-space: pre;
 }
