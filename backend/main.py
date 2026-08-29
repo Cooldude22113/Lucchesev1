@@ -10,6 +10,8 @@ from routes.conversations import router as conv_router
 from routes.files import router as files_router
 from routes.voice import router as voice_router
 from routes.traces import router as traces_router
+from routes.models import router as models_router
+from routes.settings import router as settings_router
 
 # ── Chat trace logger ────────────────────────────────────────────────────────
 # "lucchese.context" carries the per-message traces written by routes/tracer.py:
@@ -80,3 +82,5 @@ app.include_router(conv_router)
 app.include_router(files_router)
 app.include_router(voice_router)
 app.include_router(traces_router)
+app.include_router(models_router)
+app.include_router(settings_router)

@@ -22,12 +22,18 @@ from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
-from routes.config import OLLAMA_URL, MODEL_FAST, CHAT_PROVIDER, ANTHROPIC_API_KEY, whisper_model, el_client, ELEVENLABS_VOICE_ID
+from routes.config import (OLLAMA_URL, ANTHROPIC_API_KEY, ANTHROPIC_API_URL, ANTHROPIC_VERSION,
+                           whisper_model, el_client, ELEVENLABS_VOICE_ID)
 from routes.memory import should_ingest, ingest_exchange
-from routes.database import save_message, get_conversation_history
+from routes.database import save_message, get_conversation_history, get_settings
+from routes.models import resolve, fallback_model
 from routes.chat import build_system_prompt
 
 router = APIRouter()
+
+# Spoken replies are read aloud, so they stay short regardless of the
+# max_tokens used for typed chat.
+VOICE_MAX_TOKENS = 1024
 
 # ── Audio transcription helper ────────────────────────────────────────────────
 async def transcribe_audio(file: UploadFile) -> str:
@@ -131,9 +137,9 @@ async def voice_chat(file: UploadFile = File(...), conversation_id: str = None):
 
         conv_id = conversation_id or str(uuid.uuid4())
 
-        # 2. Build context
-        # ctx = await build_context(user_text)
-        system = build_system_prompt("")
+        # 2. Build context — same persona as typed chat, from settings
+        settings = get_settings()
+        system   = build_system_prompt("", settings.get("persona", ""))
 
         # Load last 20 messages for continuity
         history = get_conversation_history(conv_id, limit=20)
@@ -142,21 +148,27 @@ async def voice_chat(file: UploadFile = File(...), conversation_id: str = None):
         messages += history
         messages.append({"role": "user", "content": user_text})
 
-        # 3. LLM reply — respects CHAT_PROVIDER setting
-        if CHAT_PROVIDER == "claude":
+        # 3. LLM reply — same model registry as /chat, so the picker and the
+        #    settings default apply to spoken messages too. Voice replies are
+        #    read aloud, so they keep their own shorter token cap.
+        entry = await resolve(settings.get("default_model")) or await fallback_model()
+        if not entry or not entry["available"]:
+            raise Exception("No usable model — set ANTHROPIC_API_KEY or start Ollama")
+
+        if entry["provider"] == "anthropic":
             system_prompt = messages[0]["content"] if messages[0]["role"] == "system" else ""
             chat_messages = [m for m in messages if m["role"] != "system"]
             async with httpx.AsyncClient(timeout=300) as client:
                 res = await client.post(
-                    "https://api.anthropic.com/v1/messages",
+                    f"{ANTHROPIC_API_URL}/messages",
                     headers={
                         "x-api-key":         ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
+                        "anthropic-version": ANTHROPIC_VERSION,
                         "content-type":      "application/json",
                     },
                     json={
-                        "model":      "claude-sonnet-4-6",
-                        "max_tokens": 1024,
+                        "model":      entry["model"],
+                        "max_tokens": VOICE_MAX_TOKENS,
                         "system":     system_prompt,
                         "messages":   chat_messages,
                     }
@@ -169,7 +181,7 @@ async def voice_chat(file: UploadFile = File(...), conversation_id: str = None):
                 res = await client.post(
                     OLLAMA_URL,
                     json={
-                        "model":    MODEL_FAST,
+                        "model":    entry["model"],
                         "messages": messages,
                         "stream":   False,
                     }

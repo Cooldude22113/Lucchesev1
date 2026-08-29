@@ -13,11 +13,16 @@ from elevenlabs.client import ElevenLabs
 load_dotenv()
 
 # ── LLM config ────────────────────────────────────────────────────────────────
-OLLAMA_URL        = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") + "/api/chat"
+OLLAMA_BASE       = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_URL        = OLLAMA_BASE + "/api/chat"
+OLLAMA_TAGS_URL   = OLLAMA_BASE + "/api/tags"   # installed models, for the registry
 MODEL_FAST        = os.getenv("MODEL_FAST", "gemma2:27b")
 MODEL_DEEP        = os.getenv("MODEL_DEEP", "qwen2.5:32b")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CHAT_PROVIDER     = os.getenv("CHAT_PROVIDER", "ollama")
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1"
+ANTHROPIC_VERSION = "2023-06-01"
+CHAT_PROVIDER     = os.getenv("CHAT_PROVIDER", "ollama")   # default when no model is chosen
+MAX_TOKENS        = int(os.getenv("MAX_TOKENS", "4096"))
 
 # ── ElevenLabs ────────────────────────────────────────────────────────────────
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY")
