@@ -7,6 +7,29 @@ One entry per real decision. Newest at the top. Keep them short.
 
 ---
 
+## 2026-08 — Models are discovered, not listed; the persona lives in the database
+
+Two decisions from the model-switching work.
+
+**Discovery over a hardcoded list.** The registry asks each provider what it
+has — Anthropic's `GET /v1/models`, Ollama's `GET /api/tags` — instead of
+keeping a list in code. The reason is the model Alex is training: once it's
+pulled into Ollama it appears in the picker with no code change and no
+release. A static list would need editing every time either provider changed.
+The cost is two HTTP calls, cached for 60s, and a fallback list for when the
+Anthropic API can't be reached.
+
+**The persona moved from `chat.py` to the settings table.** The settings page
+has to edit it at runtime, which a hardcoded string can't do. `docs/character.md`
+stays the versioned default and seeds the table on first run; the database
+holds the live value once edited. This does mean the running persona is no
+longer visible in git — the trace's `build_prompt` step records what was
+actually sent, which is how you check what a given reply ran on.
+
+Unavailable models are listed greyed with their reason rather than hidden:
+"Ollama isn't reachable" tells you more than a model quietly missing, and this
+whole app exists because things were invisible.
+
 ## 2026-08 — Chat UI rebuilt from the Claude Design doc, direction 2b
 
 The redesign doc (`Lucchese Chat.dc.html`, project *Lucchese chat redesign*)

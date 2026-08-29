@@ -26,14 +26,13 @@ import asyncio
 from datetime import datetime, timezone
 from ddgs import DDGS
 from routes.memory import ingest_exchange, should_ingest, detect_memory_command, handle_memory_command
-from routes.database import save_message
-from routes.config import OLLAMA_URL, MODEL_FAST, MODEL_DEEP, ANTHROPIC_API_KEY, CHAT_PROVIDER
+from routes.database import save_message, get_settings
+from routes.config import OLLAMA_URL, ANTHROPIC_API_KEY, ANTHROPIC_API_URL, ANTHROPIC_VERSION
+from routes.models import resolve, fallback_model
 from routes import tracer
 
 
 router = APIRouter()
-
-CLAUDE_MODEL = "claude-sonnet-4-6"
 
 
 # ── Request model ─────────────────────────────────────────────────────────────
@@ -42,6 +41,7 @@ class ChatRequest(BaseModel):
     history:         Optional[list] = []
     conversation_id: Optional[str]  = None
     deep:            Optional[bool] = False
+    model:           Optional[str]  = None   # registry id; None → the default in settings
 
 # ── Web search ────────────────────────────────────────────────────────────────
 WEB_TRIGGERS = [
@@ -112,10 +112,14 @@ async def do_web_search(query: str, max_results: int = 4) -> str:
 
 
 # ── System prompt builder ─────────────────────────────────────────────────────
-def build_system_prompt(web_context: str) -> str:
+def build_system_prompt(web_context: str, persona: str = "") -> str:
     """
-    Assemble the full system prompt: today's date, the base persona, and —
-    when a web search ran — a section with the results.
+    Assemble the full system prompt: today's date, the persona, and — when a
+    web search ran — a section with the results.
+
+    `persona` comes from the settings page. The string below is only the
+    fallback for when settings hold nothing (and for callers that don't pass
+    one, such as voice.py).
     """
     now = datetime.now().strftime("%A, %d %B %Y")
 
@@ -152,7 +156,7 @@ IMPORTANT: Always use # and ## heading syntax. Never write section names as plai
 Only use this marker when the content is genuinely document-worthy (structured plans,
 programmes, checklists, reports). Not for short conversational answers."""
 
-    sections = [f"Today's date is {now}.",base]
+    sections = [f"Today's date is {now}.", persona.strip() or base]
 
     if web_context:
         sections.append(f"""Current information from the web:
@@ -169,6 +173,8 @@ Use this data to inform your response. For website reviews, analyse what the sea
 async def chat(req: ChatRequest):
     conversation_id = req.conversation_id or str(uuid.uuid4())
 
+    settings = get_settings()
+
     trace = tracer.Trace(req.message, conversation_id)
     tracer.activate(trace)
     trace.add_step(
@@ -179,7 +185,7 @@ async def chat(req: ChatRequest):
             "message_chars":    len(req.message),
             "new_conversation": not req.conversation_id,
             "history_messages": len(req.history or []),
-            "provider_setting": CHAT_PROVIDER,
+            "requested_model":  req.model or "(default)",
         },
     )
 
@@ -207,6 +213,45 @@ async def chat(req: ChatRequest):
             trace.finish(reply_ok=False)
             raise
 
+    # ── Model selection ───────────────────────────────────────────────────────
+    # Per-message choice → the default in settings → whatever the registry can
+    # offer. Resolved before anything expensive so an unusable pick fails fast.
+    with trace.step("model_selection") as s:
+        entry  = await resolve(req.model)
+        source = "the model picked for this message"
+        if not entry and req.model:
+            s.detail = {"requested": req.model, "outcome": "unknown_id"}
+            s.summary = f"Model '{req.model}' isn't in the registry — falling back to the default."
+        if not entry:
+            entry  = await resolve(settings.get("default_model"))
+            source = "the default model in settings"
+        if not entry:
+            entry  = await fallback_model()
+            source = "the first available model"
+
+        if entry:
+            trace.provider = entry["provider"]
+            trace.model    = entry["model"]
+            s.summary = (f"Using {entry['label']} ({entry['model']} via {entry['provider']}) — "
+                         f"chosen as {source}.")
+            s.detail  = {
+                "id": entry["id"], "provider": entry["provider"], "model": entry["model"],
+                "streams": entry["streams"], "available": entry["available"],
+                "source": source, "requested": req.model or None,
+            }
+        else:
+            s.status  = "error"
+            s.summary = "No usable model — no Anthropic key and Ollama isn't reachable."
+            s.detail  = {"requested": req.model or None}
+
+    if entry is None or not entry["available"]:
+        reason = (entry["note"] or "it isn't available right now") if entry else \
+                 "no model is configured — set ANTHROPIC_API_KEY or start Ollama"
+        label  = entry["label"] if entry else "No model"
+        trace.add_step("model_call", f"Didn't call a model: {reason}", status="error")
+        trace.finish(reply_ok=False)
+        return stream_plain_reply(f"[{label} can't be used — {reason}.]")
+
     # ── Normal chat flow ──────────────────────────────────────────────────────
     with trace.step("web_search_decision") as s:
         did_search, search_reason = needs_web_search(req.message)
@@ -230,8 +275,9 @@ async def chat(req: ChatRequest):
         trace.add_step("web_search", "Skipped the web search.", status="skipped")
 
     with trace.step("build_prompt") as s:
-        system_prompt = build_system_prompt(web)
-        base_chars    = len(build_system_prompt(""))
+        persona       = settings.get("persona", "")
+        system_prompt = build_system_prompt(web, persona)
+        base_chars    = len(build_system_prompt("", persona))
         web_chars     = len(system_prompt) - base_chars
         history       = req.history or []
         history_chars = sum(len(str(m.get("content", ""))) for m in history if isinstance(m, dict))
@@ -244,6 +290,7 @@ async def chat(req: ChatRequest):
                          f" (plus {len(history)} earlier messages as history).")
         s.detail = {
             "system_prompt":    system_prompt,
+            "persona_source":   "settings" if persona.strip() else "built-in fallback",
             "sections":         [{"name": "date + persona", "chars": base_chars}]
                                 + ([{"name": "web results", "chars": web_chars}] if web else []),
             "total_chars":      len(system_prompt),
@@ -271,26 +318,30 @@ async def chat(req: ChatRequest):
                 "conversation_id": conversation_id,
                 "web_search_used": did_search,
                 "trace_id":        trace.id,
+                "model":           entry["id"],
+                "model_label":     entry["label"],
+                "provider":        entry["provider"],
+                "streams":         entry["streams"],
             }) + "\n"
 
             try:
-                if CHAT_PROVIDER == "claude":
-                    trace.provider = "claude"
-                    trace.model    = CLAUDE_MODEL
-                    chat_messages  = [m for m in messages if m["role"] != "system"]
+                if entry["provider"] == "anthropic":
+                    model_name    = entry["model"]
+                    max_tokens    = settings.get("max_tokens", 4096)
+                    chat_messages = [m for m in messages if m["role"] != "system"]
                     with trace.step("model_call") as s:
-                        s.error_summary = f"The Claude API call ({CLAUDE_MODEL}) failed — no reply was generated."
+                        s.error_summary = f"The Claude API call ({model_name}) failed — no reply was generated."
                         async with httpx.AsyncClient(timeout=300) as client:
                             res = await client.post(
-                                "https://api.anthropic.com/v1/messages",
+                                f"{ANTHROPIC_API_URL}/messages",
                                 headers={
                                     "x-api-key":         ANTHROPIC_API_KEY,
-                                    "anthropic-version": "2023-06-01",
+                                    "anthropic-version": ANTHROPIC_VERSION,
                                     "content-type":      "application/json",
                                 },
                                 json={
-                                    "model":      CLAUDE_MODEL,
-                                    "max_tokens": 4096,
+                                    "model":      model_name,
+                                    "max_tokens": max_tokens,
                                     "system":     system_prompt,
                                     "messages":   chat_messages,
                                 }
@@ -298,24 +349,22 @@ async def chat(req: ChatRequest):
                         if res.status_code != 200:
                             raise Exception(f"Anthropic API error {res.status_code}: {res.text[:200]}")
                         reply_text = res.json()["content"][0]["text"]
-                        s.summary = f"Called the Claude API ({CLAUDE_MODEL}) → HTTP {res.status_code}, got {len(reply_text):,} characters back."
+                        s.summary = f"Called the Claude API ({model_name}) → HTTP {res.status_code}, got {len(reply_text):,} characters back."
                         s.detail  = {
-                            "provider":         "claude",
-                            "model":            CLAUDE_MODEL,
+                            "provider":         "anthropic",
+                            "model":            model_name,
                             "http_status":      res.status_code,
                             "request_messages": len(chat_messages) + 1,
                             "request_chars":    len(system_prompt) + sum(len(str(m.get("content", ""))) for m in chat_messages),
                             "response_chars":   len(reply_text),
-                            "max_tokens":       4096,
+                            "max_tokens":       max_tokens,
                         }
                     full_reply.append(reply_text)
                     yield json.dumps({"type": "token", "content": reply_text}) + "\n"
 
                 else:
                     # Ollama — true token streaming
-                    ollama_model   = MODEL_DEEP if req.deep else MODEL_FAST
-                    trace.provider = "ollama"
-                    trace.model    = ollama_model
+                    ollama_model = entry["model"]
                     with trace.step("model_call") as s:
                         s.error_summary = f"The local Ollama call ({ollama_model}) failed mid-stream."
                         chunk_count = 0
@@ -344,7 +393,6 @@ async def chat(req: ChatRequest):
                         s.detail  = {
                             "provider":         "ollama",
                             "model":            ollama_model,
-                            "deep_mode":        bool(req.deep),
                             "request_messages": len(messages),
                             "request_chars":    sum(len(str(m.get("content", ""))) for m in messages),
                             "response_chars":   response_chars,
@@ -353,7 +401,7 @@ async def chat(req: ChatRequest):
 
             except Exception as e:
                 reply_ok = False
-                print(f"stream_response error ({CHAT_PROVIDER}): {e}")
+                print(f"stream_response error ({entry['provider']}/{entry['model']}): {e}")
                 yield json.dumps({"type": "token", "content": "\n\n[Response error — please try again]"}) + "\n"
 
             # ── Post-processing ───────────────────────────────────────────────

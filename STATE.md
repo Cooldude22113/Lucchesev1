@@ -4,19 +4,46 @@
 right now, what would I need to know? Last thing each session: update it.
 First thing next session: read it.
 
-Last updated: 20 August 2026
+Last updated: 29 August 2026
 
 ---
 
 ## Right now
 
-The chat UI has just been rebuilt from the Claude Design doc. It lints clean,
-builds clean, and every screen has been checked in a real browser against the
-artboards — but it has **not been used against the live backend yet**. That's
-the first thing to do next session: run `start.bat`, send a few real messages,
-and watch the streaming, voice and Word-doc paths with actual data.
+**Model switching and the settings page are built, on branch
+`feat/model-switching` — not yet merged and not yet run against your real
+setup.** They were verified against stand-in Anthropic/Ollama servers and in
+a real browser, but never against your actual Ollama install or API key.
+
+First thing next session: merge or check out that branch, run `start.bat`,
+and work through the verification list in `docs/specmodelswitching.md`. Watch
+particularly that your real Ollama models appear in the picker, and that
+switching to Claude still answers.
+
+Still outstanding from before: the redesigned chat UI has **not been used
+against the live backend** either — same session's work covers both.
 
 ## Recently finished
+
+- **Model switching + settings page** (branch `feat/model-switching`).
+  - `routes/models.py`: a registry that *discovers* models rather than listing
+    them — Anthropic via `GET /v1/models`, Ollama via `GET /api/tags`. A model
+    pulled into Ollama shows up on its own, which is how a locally trained
+    model will appear with no code change. Unreachable providers report
+    unavailable with the reason instead of raising.
+  - `routes/settings.py` + a `settings` table: `default_model`, `persona`,
+    `max_tokens`, editable at runtime behind the existing `X-Admin-Key`. The
+    persona default is seeded from `docs/character.md`, which stays the
+    versioned source of truth.
+  - `chat.py` resolves a model per message (request → settings default →
+    first available), dispatches on the resolved provider, and records the
+    choice and its reason as a trace step. `CHAT_PROVIDER` is now only a
+    fallback hint; `CLAUDE_MODEL` and the hardcoded `max_tokens` are gone.
+  - `voice.py` now shares the same registry and persona, so spoken and typed
+    messages no longer drift apart.
+  - Frontend: a picker in the composer (unavailable models shown greyed with
+    the reason), the answering model labelled on each reply, and a new
+    `/settings` page.
 
 - **Chat redesign, direction 2b** — `frontend/src/App.jsx` rewritten against
   `Lucchese Chat.dc.html` (Claude Design project *Lucchese chat redesign*).
@@ -81,8 +108,8 @@ and watch the streaming, voice and Word-doc paths with actual data.
    too, so this now leaks on the chat page as well as `/admin` and `/`.
    Either keep the admin surface local-only or move to a real login the
    backend checks per request.
-5. Smaller: `Home.jsx` hardcodes the production API URL; `claude-sonnet-4-6`
-   should come from `.env` rather than the `CLAUDE_MODEL` constant.
+5. Smaller: `Home.jsx` hardcodes the production API URL. (The hardcoded
+   `CLAUDE_MODEL` constant is gone — models now come from the registry.)
 
 ## Watch out for
 
@@ -92,9 +119,14 @@ and watch the streaming, voice and Word-doc paths with actual data.
   design or leave them.
 - **The eight-second hands-free send is a timer, not silence detection.** It
   matches what `Voice.jsx` already did. Real VAD is separate work.
-- `/voice-chat` runs its own untraced copy of the chat pipeline and is drifting
-  from `chat.py` — it misses tracing and hardcodes the model name. It also now
-  misses the whole redesigned voice strip, since that lives in `App.jsx`.
+- `/voice-chat` still runs its own copy of the chat pipeline and is **still
+  untraced** — spoken messages don't appear in the Debug tab. It now at least
+  shares the model registry and persona with `chat.py`, so the two no longer
+  disagree about which model or character is in play.
+- **The settings page is writable config behind `VITE_ADMIN_KEY`**, which is
+  baked into the public JS bundle. Anyone loading the site could rewrite
+  Lucchese's instructions. Acceptable while it's one user on an obscure URL —
+  but it raises the stakes on item 4 above.
 - `backend/raw/conversations_export.json` and `raw/extracted_user_messages/`
   are real conversation exports **committed to git**. Fine while the repo is
   private; `git rm --cached` them before it's ever shared.

@@ -1,9 +1,10 @@
 """
 database.py
 All SQLite database operations for Lucchese.
-Handles: schema init, conversations, messages, documents, roleplay sessions.
+Handles: schema init, conversations, messages, documents, traces, settings.
 """
 
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -71,8 +72,16 @@ def init_db():
     cur.execute(
         "CREATE INDEX IF NOT EXISTS idx_traces_created ON traces(created_at)"
     )
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
     con.commit()
     con.close()
+    _seed_settings()
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
@@ -233,6 +242,94 @@ def get_trace(trace_id: str) -> dict | None:
     ).fetchone()
     con.close()
     return dict(row) if row else None
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+# Runtime configuration the settings page edits: which model answers by default,
+# and the persona Lucchese is given. The persona's *default* is versioned in
+# docs/character.md; this table holds the live value once it has been edited.
+
+CHARACTER_DOC = os.path.join(os.path.dirname(__file__), "..", "..", "docs", "character.md")
+
+_PERSONA_FALLBACK = (
+    "You are Lucchese, the personal AI of Alex Hammond.\n\n"
+    "Speak to him like a straight-talking, knowledgeable friend — not an "
+    "assistant trying to please him. Be direct. Never open with praise.\n"
+)
+
+
+def _persona_default() -> str:
+    """The prompt block from docs/character.md, or a terse fallback if the doc
+    isn't there (the backend must boot regardless of what's in docs/)."""
+    try:
+        with open(CHARACTER_DOC, encoding="utf-8") as f:
+            doc = f.read()
+        after = doc.split("## THE PROMPT", 1)[1]
+        return after.split("```")[1].strip()
+    except Exception:
+        return _PERSONA_FALLBACK.strip()
+
+
+def _seed_settings():
+    """Insert defaults for any setting that has never been written. Existing
+    values are left alone, so this is safe on every startup."""
+    from routes.config import MAX_TOKENS
+    defaults = {
+        "default_model": "",                 # resolved from the registry when blank
+        "persona":       _persona_default(),
+        "max_tokens":    str(MAX_TOKENS),
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    con = get_con()
+    try:
+        for key, value in defaults.items():
+            con.execute(
+                "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now),
+            )
+        con.commit()
+    except Exception as e:
+        print(f"_seed_settings error: {e}")
+        con.rollback()
+    finally:
+        con.close()
+
+
+def get_settings() -> dict:
+    con = get_con()
+    try:
+        rows = con.execute("SELECT key, value FROM settings").fetchall()
+    finally:
+        con.close()
+    out = {r["key"]: r["value"] for r in rows}
+    try:
+        out["max_tokens"] = int(out.get("max_tokens", 4096))
+    except (TypeError, ValueError):
+        out["max_tokens"] = 4096
+    return out
+
+
+def update_settings(values: dict) -> dict:
+    """Write the given keys and return the full settings afterwards.
+    Unknown keys are ignored — the settings page can't invent config."""
+    allowed = {"default_model", "persona", "max_tokens"}
+    now     = datetime.now(timezone.utc).isoformat()
+    con     = get_con()
+    try:
+        for key, value in values.items():
+            if key in allowed and value is not None:
+                con.execute("""
+                    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                   updated_at = excluded.updated_at
+                """, (key, str(value), now))
+        con.commit()
+    except Exception as e:
+        print(f"update_settings error: {e}")
+        con.rollback()
+    finally:
+        con.close()
+    return get_settings()
 
 
 # ── Session DB helpers ────────────────────────────────────────────────────────
