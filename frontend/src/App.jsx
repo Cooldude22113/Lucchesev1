@@ -3,6 +3,7 @@ import AdminPanel from "./AdminPanel";
 import Home from "./Home";
 import ReactMarkdown from "react-markdown";
 import Voice from "./Voice";
+import Settings from "./Settings";
 
 const API = import.meta.env.VITE_API_URL || "https://api.lucchese.app";
 
@@ -432,7 +433,7 @@ function DocCard({ content, title, mobile }) {
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
-function Message({ role, content, viaVoice, pending, streaming, isLatest, exchange, mobile }) {
+function Message({ role, content, viaVoice, pending, streaming, isLatest, exchange, model, mobile }) {
   const isUser = role === "user";
   const [rated, setRated] = useState(null);
 
@@ -530,6 +531,13 @@ function Message({ role, content, viaVoice, pending, streaming, isLatest, exchan
               <span style={{ font: `400 11px ${SANS}`, color: C.ghost, letterSpacing: .6 }}>
                 Auto-saved to memory
               </span>
+            )}
+            {model && (
+              <span style={{
+                marginLeft: "auto", font: `400 11px ${SANS}`,
+                color: C.ghost, letterSpacing: .5,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "45%",
+              }} title={`Answered by ${model}`}>{model}</span>
             )}
           </div>
         )}
@@ -1104,6 +1112,14 @@ function ChatApp() {
   const [memoryCount, setMemoryCount]     = useState(null);
   const [lastExchange, setLastExchange]   = useState(null);
 
+  // Model picker. `model` is a registry id from GET /models; null means "use
+  // whatever the backend has as its default".
+  const [models, setModels]             = useState([]);
+  const [model, setModel]               = useState(() => {
+    try { return localStorage.getItem("lucchese.model") || null; } catch { return null; }
+  });
+  const [modelOpen, setModelOpen]       = useState(false);
+
   const [voiceMode, setVoiceMode]       = useState(false);
   const [voiceState, setVoiceState]     = useState(null); // listening | thinking | speaking
   const [listenSecs, setListenSecs]     = useState(0);
@@ -1128,6 +1144,27 @@ function ChatApp() {
   const sendRef           = useRef(null);
 
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
+
+  // The model list. Unavailable models are kept and shown greyed with their
+  // reason — "not loaded in Ollama" tells you more than silently hiding it.
+  useEffect(() => {
+    fetch(`${API}/models`)
+      .then(r => r.json())
+      .then(d => {
+        const list = Array.isArray(d?.models) ? d.models : [];
+        setModels(list);
+        setModel(cur => (cur && list.some(m => m.id === cur) ? cur : d?.default || null));
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (model) localStorage.setItem("lucchese.model", model);
+    } catch { /* private browsing — the picker just won't persist */ }
+  }, [model]);
+
+  const activeModel = models.find(m => m.id === model) || null;
 
   const fetchConversations = useCallback(async () => {
     try {
@@ -1418,7 +1455,7 @@ function ChatApp() {
       const res = await fetch(`${API}/chat`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ message: text, history, conversation_id: activeId }),
+        body:    JSON.stringify({ message: text, history, conversation_id: activeId, model }),
         signal:  controller.signal,
       });
 
@@ -1444,7 +1481,12 @@ function ChatApp() {
           if (chunk.type === "meta") {
             if (!activeId) setActiveId(chunk.conversation_id);
             if (!bubbleAdded) {
-              setMessages(prev => [...prev, { role: "assistant", content: "" }]);
+              // The backend reports which model actually answered — it may
+              // differ from the pick if that one was unknown or unavailable.
+              setMessages(prev => [...prev, {
+                role: "assistant", content: "",
+                model: chunk.model_label || chunk.model || null,
+              }]);
               bubbleAdded = true;
               setStreaming(true);
             }
@@ -1456,7 +1498,8 @@ function ChatApp() {
             flushSentences();
             setMessages(prev => {
               const updated = [...prev];
-              updated[updated.length - 1] = { role: "assistant", content: fullReply };
+              const last = updated[updated.length - 1] || {};
+              updated[updated.length - 1] = { ...last, role: "assistant", content: fullReply };
               return updated;
             });
           }
@@ -1835,6 +1878,86 @@ function ChatApp() {
                     </svg>
                   </button>
 
+                  {/* Model picker — which brain answers the next message */}
+                  <div style={{ position: "relative", flexShrink: 0 }}>
+                    <button
+                      onClick={() => setModelOpen(o => !o)}
+                      title={activeModel ? `Answering with ${activeModel.label}` : "Choose a model"}
+                      style={{
+                        height: mobile ? 44 : 30,
+                        margin: mobile ? "-6px 0" : 0,
+                        padding: mobile ? "0 12px" : "0 10px",
+                        borderRadius: mobile ? 12 : 8,
+                        background: modelOpen ? C.goldWash : "transparent",
+                        border: `1px solid ${modelOpen ? C.goldLine : C.composerLine}`,
+                        color: activeModel?.available === false ? C.red : C.dim,
+                        display: "flex", alignItems: "center", gap: 6,
+                        maxWidth: mobile ? 150 : 210,
+                      }}
+                    >
+                      <span style={{
+                        font: `400 11.5px ${SANS}`, letterSpacing: .3,
+                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      }}>
+                        {activeModel ? activeModel.label : "Model"}
+                      </span>
+                      <span style={{ font: `400 8px ${SANS}`, opacity: .7 }}>▼</span>
+                    </button>
+
+                    {modelOpen && (
+                      <>
+                        {/* click-away */}
+                        <div onClick={() => setModelOpen(false)}
+                             style={{ position: "fixed", inset: 0, zIndex: 40 }} />
+                        <div style={{
+                          position: "absolute", bottom: "calc(100% + 8px)", left: 0, zIndex: 41,
+                          minWidth: 260, maxWidth: 340, maxHeight: 300, overflowY: "auto",
+                          background: C.surface, border: `1px solid ${C.surfaceLine}`,
+                          borderRadius: 12, padding: 6,
+                          boxShadow: "0 18px 50px #000000cc",
+                        }}>
+                          {models.length === 0 && (
+                            <p style={{ margin: 0, padding: "10px 12px", font: `400 12px ${SANS}`, color: C.faint }}>
+                              No models found — is the backend running?
+                            </p>
+                          )}
+                          {models.map(m => {
+                            const on = m.id === model;
+                            return (
+                              <button
+                                key={m.id}
+                                disabled={!m.available}
+                                onClick={() => { setModel(m.id); setModelOpen(false); }}
+                                title={m.note || m.model}
+                                style={{
+                                  display: "block", width: "100%", textAlign: "left",
+                                  padding: "8px 10px", borderRadius: 8, border: "none",
+                                  background: on ? C.goldWash : "transparent",
+                                  cursor: m.available ? "pointer" : "not-allowed",
+                                  opacity: m.available ? 1 : .5,
+                                }}
+                              >
+                                <span style={{
+                                  display: "block", font: `${on ? 500 : 400} 12.5px ${SANS}`,
+                                  color: on ? C.gold : C.body,
+                                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                                }}>{m.label}</span>
+                                <span style={{
+                                  display: "block", marginTop: 2, font: `400 10.5px ${SANS}`,
+                                  color: m.available ? C.faint : C.red,
+                                }}>
+                                  {m.available
+                                    ? `${m.provider}${m.streams ? " · streams" : ""}`
+                                    : m.note}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </div>
+
                   {!mobile && (
                     <span style={{
                       marginLeft: "auto", font: `400 10.5px ${SANS}`,
@@ -1882,6 +2005,7 @@ export default function App() {
   const path = window.location.pathname;
 
   if (path === "/admin") return <AdminPanel />;
+  if (path === "/settings") return <Settings />;
   if (path === "/" || path === "/home") return <Home />;
   if (path === "/voice") return <Voice />;
 
