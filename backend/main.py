@@ -12,6 +12,7 @@ from routes.voice import router as voice_router
 from routes.traces import router as traces_router
 from routes.models import router as models_router
 from routes.settings import router as settings_router
+from routes.owner import router as owner_router
 
 # ── Chat trace logger ────────────────────────────────────────────────────────
 # "lucchese.context" carries the per-message traces written by routes/tracer.py:
@@ -84,3 +85,4 @@ app.include_router(voice_router)
 app.include_router(traces_router)
 app.include_router(models_router)
 app.include_router(settings_router)
+app.include_router(owner_router)

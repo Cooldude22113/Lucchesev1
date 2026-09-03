@@ -4,6 +4,7 @@ import Home from "./Home";
 import ReactMarkdown from "react-markdown";
 import Voice from "./Voice";
 import Settings from "./Settings";
+import Owner from "./Owner";
 
 const API = import.meta.env.VITE_API_URL || "https://api.lucchese.app";
 
@@ -2006,6 +2007,7 @@ export default function App() {
 
   if (path === "/admin") return <AdminPanel />;
   if (path === "/settings") return <Settings />;
+  if (path === "/owner") return <Owner />;
   if (path === "/" || path === "/home") return <Home />;
   if (path === "/voice") return <Voice />;
 
